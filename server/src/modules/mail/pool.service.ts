@@ -130,6 +130,7 @@ export const poolService = {
                 email: true,
                 clientId: true,
                 refreshToken: true,
+                tokenVersion: true,
                 groupId: true,
                 group: {
                     select: {

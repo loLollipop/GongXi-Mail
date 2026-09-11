@@ -137,6 +137,7 @@ const emailRoutes: FastifyPluginAsync = async (fastify) => {
             email: emailData.email,
             clientId: emailData.clientId,
             refreshToken: emailData.refreshToken!,
+            tokenVersion: emailData.tokenVersion,
             autoAssigned: false,
             fetchStrategy: emailData.group?.fetchStrategy,
         };
@@ -158,6 +159,7 @@ const emailRoutes: FastifyPluginAsync = async (fastify) => {
             email: emailData.email,
             clientId: emailData.clientId,
             refreshToken: emailData.refreshToken!,
+            tokenVersion: emailData.tokenVersion,
             autoAssigned: false,
             fetchStrategy: emailData.group?.fetchStrategy,
         };

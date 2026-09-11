@@ -111,7 +111,7 @@ export const groupService = {
         // 先将该组下所有邮箱的 groupId 置 null
         await prisma.emailAccount.updateMany({
             where: { groupId: id },
-            data: { groupId: null },
+            data: { groupId: null, tokenVersion: { increment: 1 } },
         });
 
         await prisma.emailGroup.delete({ where: { id } });
@@ -129,7 +129,7 @@ export const groupService = {
 
         const result = await prisma.emailAccount.updateMany({
             where: { id: { in: emailIds } },
-            data: { groupId },
+            data: { groupId, tokenVersion: { increment: 1 } },
         });
 
         return { success: true, count: result.count };
@@ -144,7 +144,7 @@ export const groupService = {
                 id: { in: emailIds },
                 groupId,
             },
-            data: { groupId: null },
+            data: { groupId: null, tokenVersion: { increment: 1 } },
         });
 
         return { success: true, count: result.count };

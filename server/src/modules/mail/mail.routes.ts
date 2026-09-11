@@ -149,6 +149,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
             email: emailAccount.email,
             clientId: emailAccount.clientId,
             refreshToken: emailAccount.refreshToken!,
+            tokenVersion: emailAccount.tokenVersion,
             autoAssigned: false,
             fetchStrategy: emailAccount.fetchStrategy,
         };
@@ -161,7 +162,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
                 http: input.http,
             });
 
-            await mailService.updateEmailStatus(credentials.id, true);
+            await mailService.updateEmailStatus(credentials.id, true, undefined, credentials.tokenVersion);
 
             await mailService.logApiCall(
                 MAIL_LOG_ACTIONS.MAIL_NEW,
@@ -179,7 +180,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
                 email: credentials.email,
             };
         } catch (err: unknown) {
-            await mailService.updateEmailStatus(credentials.id, false, getErrorMessage(err));
+            await mailService.updateEmailStatus(credentials.id, false, getErrorMessage(err), credentials.tokenVersion);
             await mailService.logApiCall(
                 MAIL_LOG_ACTIONS.MAIL_NEW,
                 request.apiKey.id,
@@ -236,6 +237,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
             email: emailAccount.email,
             clientId: emailAccount.clientId,
             refreshToken: emailAccount.refreshToken!,
+            tokenVersion: emailAccount.tokenVersion,
             autoAssigned: false,
             fetchStrategy: emailAccount.fetchStrategy,
         };
@@ -246,7 +248,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
                 limit: 1, // 只取最新一封
             });
 
-            await mailService.updateEmailStatus(credentials.id, true);
+            await mailService.updateEmailStatus(credentials.id, true, undefined, credentials.tokenVersion);
             await mailService.logApiCall(
                 MAIL_LOG_ACTIONS.MAIL_TEXT,
                 request.apiKey.id,
@@ -287,7 +289,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
             return reply.type('text/plain').send(content);
 
         } catch (err: unknown) {
-            await mailService.updateEmailStatus(credentials.id, false, getErrorMessage(err));
+            await mailService.updateEmailStatus(credentials.id, false, getErrorMessage(err), credentials.tokenVersion);
             await mailService.logApiCall(
                 MAIL_LOG_ACTIONS.MAIL_TEXT,
                 request.apiKey.id,
@@ -326,6 +328,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
             email: emailAccount.email,
             clientId: emailAccount.clientId,
             refreshToken: emailAccount.refreshToken!,
+            tokenVersion: emailAccount.tokenVersion,
             autoAssigned: false,
             fetchStrategy: emailAccount.fetchStrategy,
         };
@@ -337,7 +340,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
                 http: input.http,
             });
 
-            await mailService.updateEmailStatus(credentials.id, true);
+            await mailService.updateEmailStatus(credentials.id, true, undefined, credentials.tokenVersion);
 
             await mailService.logApiCall(
                 MAIL_LOG_ACTIONS.MAIL_ALL,
@@ -355,7 +358,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
                 email: credentials.email,
             };
         } catch (err: unknown) {
-            await mailService.updateEmailStatus(credentials.id, false, getErrorMessage(err));
+            await mailService.updateEmailStatus(credentials.id, false, getErrorMessage(err), credentials.tokenVersion);
             await mailService.logApiCall(
                 MAIL_LOG_ACTIONS.MAIL_ALL,
                 request.apiKey.id,
@@ -394,6 +397,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
             email: emailAccount.email,
             clientId: emailAccount.clientId,
             refreshToken: emailAccount.refreshToken!,
+            tokenVersion: emailAccount.tokenVersion,
             autoAssigned: false,
             fetchStrategy: emailAccount.fetchStrategy,
         };
@@ -405,7 +409,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
                 http: input.http,
             });
 
-            await mailService.updateEmailStatus(credentials.id, true);
+            await mailService.updateEmailStatus(credentials.id, true, undefined, credentials.tokenVersion);
 
             await mailService.logApiCall(
                 MAIL_LOG_ACTIONS.PROCESS_MAILBOX,
@@ -423,7 +427,7 @@ const mailRoutes: FastifyPluginAsync = async (fastify) => {
                 email: credentials.email,
             };
         } catch (err: unknown) {
-            await mailService.updateEmailStatus(credentials.id, false, getErrorMessage(err));
+            await mailService.updateEmailStatus(credentials.id, false, getErrorMessage(err), credentials.tokenVersion);
             await mailService.logApiCall(
                 MAIL_LOG_ACTIONS.PROCESS_MAILBOX,
                 request.apiKey.id,

@@ -18,6 +18,7 @@ import authRoutes from './modules/auth/auth.routes.js';
 import adminRoutes from './modules/admin/admin.routes.js';
 import apiKeyRoutes from './modules/api-key/apiKey.routes.js';
 import emailRoutes from './modules/email/email.routes.js';
+import reauthorizationRoutes from './modules/email-reauthorization/reauthorization.routes.js';
 import groupRoutes from './modules/email/group.routes.js';
 import mailRoutes from './modules/mail/mail.routes.js';
 import dashboardRoutes from './modules/dashboard/dashboard.routes.js';
@@ -96,6 +97,7 @@ export async function buildApp() {
     await fastify.register(adminRoutes, { prefix: '/admin/admins' });
     await fastify.register(apiKeyRoutes, { prefix: '/admin/api-keys' });
     await fastify.register(emailRoutes, { prefix: '/admin/emails' });
+    await fastify.register(reauthorizationRoutes, { prefix: '/admin/email-reauthorizations' });
     await fastify.register(groupRoutes, { prefix: '/admin/email-groups' });
     await fastify.register(dashboardRoutes, { prefix: '/admin/dashboard' });
 

@@ -4,6 +4,8 @@ import { AppError } from '../../plugins/error.js';
 import { logger } from '../../lib/logger.js';
 import { setCache, getCache } from '../../lib/redis.js';
 import { proxyFetch } from '../../lib/proxy.js';
+import { persistRotatedToken } from '../../lib/rotated-token.js';
+import { readMicrosoftError, type MicrosoftOAuthError } from '../../lib/microsoft-oauth.js';
 import prisma from '../../lib/prisma.js';
 import type { MailRequestInput } from './mail.schema.js';
 import Imap from 'node-imap';
@@ -16,6 +18,7 @@ interface Credentials {
     email: string;
     clientId: string;
     refreshToken: string;
+    tokenVersion: number;
     autoAssigned: boolean;
     fetchStrategy?: MailFetchStrategy;
 }
@@ -31,6 +34,7 @@ interface EmailMessage {
 
 interface OAuthTokenResponse {
     access_token?: string;
+    refresh_token?: string;
     expires_in?: number;
     scope?: string;
 }
@@ -60,6 +64,26 @@ function getErrorMessage(error: unknown): string {
     }
     const message = (error as { message?: unknown }).message;
     return typeof message === 'string' && message.trim() ? message : 'Unknown error';
+}
+
+export class ProtocolConsentRequiredError extends AppError {
+    constructor(message: string) {
+        super('REAUTHORIZATION_REQUIRED', message, 409);
+        this.name = 'ProtocolConsentRequiredError';
+    }
+}
+
+function oauthReauthorizationError(error: MicrosoftOAuthError): AppError {
+    return error.kind === 'PROTOCOL_CONSENT_REQUIRED'
+        ? new ProtocolConsentRequiredError(error.message)
+        : new AppError('REAUTHORIZATION_REQUIRED', error.message, 409);
+}
+
+function isTerminalFallbackError(error: unknown): boolean {
+    return error instanceof AppError && (
+        error.code === 'ACCOUNT_CHANGED' ||
+        (error.code === 'REAUTHORIZATION_REQUIRED' && !(error instanceof ProtocolConsentRequiredError))
+    );
 }
 
 export const mailService = {
@@ -108,11 +132,12 @@ export const mailService = {
     /**
      * 更新邮箱状态
      */
-    async updateEmailStatus(emailId: number, success: boolean, errorMessage?: string) {
+    async updateEmailStatus(emailId: number, success: boolean, errorMessage?: string, tokenVersion?: number) {
         await emailService.updateStatus(
             emailId,
             success ? 'ACTIVE' : 'ERROR',
-            errorMessage
+            errorMessage,
+            tokenVersion
         );
     },
 
@@ -152,7 +177,7 @@ export const mailService = {
         credentials: Credentials,
         proxyConfig?: { socks5?: string; http?: string }
     ): Promise<{ accessToken: string; hasMailRead: boolean } | null> {
-        const cacheKey = `graph_api_access_token_${credentials.email}`;
+        const cacheKey = `graph_api_access_token_${credentials.id}_v${credentials.tokenVersion}`;
 
         // 尝试从缓存获取（缓存的 token 一定有 Mail.Read 权限）
         const cachedToken = await getCache(cacheKey);
@@ -166,6 +191,7 @@ export const mailService = {
                 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
                 {
                     method: 'POST',
+                    signal: AbortSignal.timeout(15000),
                     headers: {
                         'Content-Type': 'application/x-www-form-urlencoded',
                     },
@@ -180,8 +206,12 @@ export const mailService = {
             );
 
             if (!response.ok) {
-                const errorText = await response.text();
-                logger.error({ email: credentials.email, status: response.status, error: errorText }, 'Graph API token request failed');
+                const error = await readMicrosoftError(response);
+                logger.warn({ emailId: credentials.id, status: response.status, code: error.code }, 'Graph API token request failed');
+                if (error.reauthorizationRequired) {
+                    await emailService.updateStatus(credentials.id, 'ERROR', error.message, credentials.tokenVersion);
+                    throw oauthReauthorizationError(error);
+                }
                 return null;
             }
 
@@ -189,7 +219,7 @@ export const mailService = {
 
             // 检查是否有邮件读取权限
             const scopeText = typeof data.scope === 'string' ? data.scope : '';
-            const hasMailRead = scopeText.includes('https://graph.microsoft.com/Mail.Read');
+            const hasMailRead = scopeText.split(' ').some((scope) => /^(?:https:\/\/graph\.microsoft\.com\/)?Mail\.(?:Read|ReadWrite)$/i.test(scope));
             const accessToken = typeof data.access_token === 'string' ? data.access_token : null;
 
             if (!accessToken) {
@@ -197,17 +227,22 @@ export const mailService = {
                 return null;
             }
 
+            if (!await persistRotatedToken(credentials, data.refresh_token)) {
+                throw new AppError('ACCOUNT_CHANGED', 'Account credentials changed; retry the request', 409);
+            }
+
             if (hasMailRead) {
                 // 只有有 Mail.Read 权限时才缓存
                 const expireTime = ((typeof data.expires_in === 'number' ? data.expires_in : 3600) - 60);
-                await setCache(cacheKey, accessToken, expireTime);
+                await setCache(`graph_api_access_token_${credentials.id}_v${credentials.tokenVersion}`, accessToken, Math.max(1, expireTime));
             } else {
                 logger.warn({ email: credentials.email }, 'No Mail.Read scope in token, will fallback to IMAP');
             }
 
             return { accessToken, hasMailRead };
         } catch (err) {
-            logger.error({ err, email: credentials.email }, 'Failed to get Graph API token');
+            if (err instanceof AppError) throw err;
+            logger.error({ emailId: credentials.id }, 'Failed to get Graph API token');
             return null;
         }
     },
@@ -243,8 +278,7 @@ export const mailService = {
             );
 
             if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(`Graph API error: ${response.status} - ${errorText}`);
+                throw new Error(`Graph API error: HTTP ${response.status}`);
             }
 
             const data = await response.json() as GraphMessagesResponse;
@@ -271,7 +305,7 @@ export const mailService = {
         credentials: Credentials,
         proxyConfig?: { socks5?: string; http?: string }
     ): Promise<string | null> {
-        const cacheKey = `imap_api_access_token_${credentials.email}`;
+        const cacheKey = `imap_api_access_token_${credentials.id}_v${credentials.tokenVersion}`;
 
         const cachedToken = await getCache(cacheKey);
         if (cachedToken) {
@@ -284,6 +318,7 @@ export const mailService = {
                 'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
                 {
                     method: 'POST',
+                    signal: AbortSignal.timeout(15000),
                     headers: {
                         'Content-Type': 'application/x-www-form-urlencoded',
                     },
@@ -298,8 +333,12 @@ export const mailService = {
             );
 
             if (!response.ok) {
-                const errorText = await response.text();
-                logger.error({ email: credentials.email, status: response.status, error: errorText }, 'IMAP token request failed');
+                const error = await readMicrosoftError(response);
+                logger.warn({ emailId: credentials.id, status: response.status, code: error.code }, 'IMAP token request failed');
+                if (error.reauthorizationRequired) {
+                    await emailService.updateStatus(credentials.id, 'ERROR', error.message, credentials.tokenVersion);
+                    throw oauthReauthorizationError(error);
+                }
                 return null;
             }
 
@@ -310,12 +349,16 @@ export const mailService = {
                 return null;
             }
 
+            if (!await persistRotatedToken(credentials, data.refresh_token)) {
+                throw new AppError('ACCOUNT_CHANGED', 'Account credentials changed; retry the request', 409);
+            }
             const expireTime = ((typeof data.expires_in === 'number' ? data.expires_in : 3600) - 60);
-            await setCache(cacheKey, accessToken, expireTime);
+            await setCache(`imap_api_access_token_${credentials.id}_v${credentials.tokenVersion}`, accessToken, Math.max(1, expireTime));
 
             return accessToken;
         } catch (err) {
-            logger.error({ err, email: credentials.email }, 'Failed to get IMAP token');
+            if (err instanceof AppError) throw err;
+            logger.error({ emailId: credentials.id }, 'Failed to get IMAP token');
             return null;
         }
     },
@@ -519,6 +562,7 @@ export const mailService = {
             try {
                 return await fetchViaImap();
             } catch (imapErr) {
+                if (isTerminalFallbackError(imapErr)) throw imapErr;
                 logger.warn({ imapErr, email: credentials.email }, 'IMAP failed, fallback to Graph API');
                 return fetchViaGraph();
             }
@@ -527,6 +571,7 @@ export const mailService = {
         try {
             return await fetchViaGraph();
         } catch (graphErr) {
+            if (isTerminalFallbackError(graphErr)) throw graphErr;
             logger.warn({ graphErr, email: credentials.email }, 'Graph API failed, fallback to IMAP');
             return fetchViaImap();
         }

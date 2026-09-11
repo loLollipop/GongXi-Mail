@@ -379,6 +379,47 @@ export const authApi = {
         requestPost<{ enabled: boolean }, { password: string; otp: string }>('/admin/auth/2fa/disable', { password, otp }),
 };
 
+export type ReauthorizationStatus = 'STARTING' | 'PENDING' | 'POLLING' | 'SUCCEEDED' | 'MISMATCH' | 'DECLINED' | 'EXPIRED' | 'CANCELLED' | 'FAILED';
+export interface ReauthorizationSession {
+    sessionId: string;
+    emailId: number;
+    email: string;
+    userCode: string | null;
+    verificationUri: string | null;
+    verificationUriComplete: string | null;
+    expiresAt: string;
+    interval: number;
+    nextPollAt: string;
+    status: ReauthorizationStatus;
+    errorCode: string | null;
+    errorMessage: string | null;
+    authorizedEmail: string | null;
+    createdBy: number | null;
+    createdAt: string;
+    completedAt: string | null;
+    serverTime: string;
+}
+export interface ReauthorizationCandidate {
+    emailId: number;
+    email: string;
+    groupName: string | null;
+    reason: string;
+    supported: boolean;
+    unsupportedReason: string | null;
+    activeSession: ReauthorizationSession | null;
+}
+const reauthorizationPrefix = '/admin/email-reauthorizations';
+const reauthorizationMutation = {
+    invalidatePrefixes: [reauthorizationPrefix, '/admin/emails', '/admin/dashboard'],
+};
+export const reauthorizationApi = {
+    candidates: () => requestGet<ReauthorizationCandidate[]>(`${reauthorizationPrefix}/candidates`, { cacheMs: 0, dedupe: false }),
+    start: (emailId: number) => requestPost<ReauthorizationSession>(`${reauthorizationPrefix}/start`, { emailId }, reauthorizationMutation),
+    get: (id: string) => requestGet<ReauthorizationSession>(`${reauthorizationPrefix}/${id}`, { cacheMs: 0, dedupe: false }),
+    poll: (id: string) => requestPost<ReauthorizationSession>(`${reauthorizationPrefix}/${id}/poll`, {}, reauthorizationMutation),
+    cancel: (id: string) => requestPost<ReauthorizationSession>(`${reauthorizationPrefix}/${id}/cancel`, {}, reauthorizationMutation),
+};
+
 // ========================================
 // 管理员 API
 // ========================================

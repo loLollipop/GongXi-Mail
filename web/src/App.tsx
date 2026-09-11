@@ -10,6 +10,7 @@ const LoginPage = lazy(() => import('./pages/login'));
 const MainLayout = lazy(() => import('./layouts/MainLayout'));
 const DashboardPage = lazy(() => import('./pages/dashboard'));
 const EmailsPage = lazy(() => import('./pages/emails'));
+const ReauthorizationsPage = lazy(() => import('./pages/reauthorizations'));
 const ApiKeysPage = lazy(() => import('./pages/api-keys'));
 const ApiDocsPage = lazy(() => import('./pages/api-docs'));
 const OperationLogsPage = lazy(() => import('./pages/operation-logs'));
@@ -85,6 +86,7 @@ const App: React.FC = () => {
               <Route index element={<Navigate to="/dashboard" replace />} />
               <Route path="dashboard" element={withSuspense(<DashboardPage />)} />
               <Route path="emails" element={withSuspense(<EmailsPage />)} />
+              <Route path="reauthorizations" element={<SuperAdminRoute>{withSuspense(<ReauthorizationsPage />)}</SuperAdminRoute>} />
               <Route path="api-keys" element={withSuspense(<ApiKeysPage />)} />
               <Route path="api-docs" element={withSuspense(<ApiDocsPage />)} />
               <Route path="operation-logs" element={withSuspense(<OperationLogsPage />)} />

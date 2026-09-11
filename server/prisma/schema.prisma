@@ -26,6 +26,7 @@ model Admin {
   updatedAt    DateTime  @updatedAt @map("updated_at")
 
   apiKeys ApiKey[]
+  emailReauthorizations EmailReauthorization[]
 
   @@map("admins")
 }
@@ -82,6 +83,7 @@ model EmailAccount {
   clientId     String      @map("client_id") @db.VarChar(100)
   password     String?     @db.VarChar(255)
   refreshToken String      @map("refresh_token") @db.Text
+  tokenVersion Int         @default(0) @map("token_version")
   status       EmailStatus @default(ACTIVE)
   groupId      Int?        @map("group_id")
   lastCheckAt  DateTime?   @map("last_check_at")
@@ -93,8 +95,59 @@ model EmailAccount {
   group   EmailGroup?  @relation(fields: [groupId], references: [id], onDelete: SetNull)
   usages  EmailUsage[]
   apiLogs ApiLog[]
+  reauthorizations EmailReauthorization[]
 
   @@map("email_accounts")
+}
+
+// activeEmailId is a nullable unique slot: PostgreSQL allows many NULLs,
+// while every live session for an account must hold its account ID here.
+model EmailReauthorization {
+  id String @id @default(uuid()) @db.Uuid
+  emailId Int @map("email_id")
+  activeEmailId Int? @unique @map("active_email_id")
+  email String @db.VarChar(255)
+  clientId String @map("client_id") @db.VarChar(100)
+  tokenVersion Int @map("token_version")
+  createdBy Int? @map("created_by")
+  status ReauthorizationStatus @default(STARTING)
+  deviceCode String? @map("device_code") @db.Text
+  userCode String? @map("user_code") @db.VarChar(100)
+  verificationUri String? @map("verification_uri") @db.Text
+  verificationUriComplete String? @map("verification_uri_complete") @db.Text
+  expiresAt DateTime @map("expires_at")
+  interval Int @default(5)
+  nextPollAt DateTime @map("next_poll_at")
+  pollLeaseUntil DateTime? @map("poll_lease_until")
+  pollClaim String? @map("poll_claim") @db.Uuid
+  errorCode String? @map("error_code") @db.VarChar(100)
+  errorMessage String? @map("error_message") @db.Text
+  authorizedEmail String? @map("authorized_email") @db.VarChar(255)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  completedAt DateTime? @map("completed_at")
+
+  account EmailAccount @relation(fields: [emailId], references: [id], onDelete: Cascade)
+  creator Admin? @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+
+  @@index([status, expiresAt])
+  @@index([status, pollLeaseUntil])
+  @@index([emailId, createdAt])
+  @@index([createdBy, createdAt])
+  @@index([completedAt])
+  @@map("email_reauthorizations")
+}
+
+enum ReauthorizationStatus {
+  STARTING
+  PENDING
+  POLLING
+  SUCCEEDED
+  MISMATCH
+  DECLINED
+  EXPIRED
+  CANCELLED
+  FAILED
 }
 
 // ============================================

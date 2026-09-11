@@ -6,7 +6,9 @@ const globalForPrisma = globalThis as unknown as {
 };
 
 export const prisma = globalForPrisma.prisma ?? new PrismaClient({
-    log: env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
+    // Prisma's automatic error output can include query arguments (encrypted
+    // tokens and device codes). Callers report normalized operation failures.
+    log: env.NODE_ENV === 'development' ? ['warn'] : [],
 });
 
 if (env.NODE_ENV !== 'production') {

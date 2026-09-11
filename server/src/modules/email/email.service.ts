@@ -1,8 +1,71 @@
 import prisma from '../../lib/prisma.js';
 import { encrypt, decrypt } from '../../lib/crypto.js';
 import { AppError } from '../../plugins/error.js';
+import { requiresReauthorization } from '../../lib/microsoft-oauth.js';
 import type { Prisma } from '@prisma/client';
 import type { CreateEmailInput, UpdateEmailInput, ListEmailInput, ImportEmailInput } from './email.schema.js';
+
+type EmailStatus = 'ACTIVE' | 'ERROR' | 'DISABLED';
+
+export function statusUpdateDecision(
+    current: { status: EmailStatus; errorMessage: string | null },
+    requested: { status: EmailStatus; errorMessage?: string | null },
+): { status?: EmailStatus; errorMessage?: string | null } {
+    // A reauthorization marker is sticky until a new refresh token is saved.
+    // Successful downstream work may have used an already cached access token,
+    // while an unrelated downstream failure must not hide the actionable cause.
+    if (requiresReauthorization(current.errorMessage)) return {};
+    return { status: requested.status, errorMessage: requested.errorMessage || null };
+}
+
+type EmailStatusDb = Pick<Prisma.TransactionClient, 'emailAccount'>;
+
+export async function updateEmailStatusWithDb(
+    db: EmailStatusDb,
+    id: number,
+    status: EmailStatus,
+    errorMessage?: string | null,
+    tokenVersion?: number,
+): Promise<void> {
+    const current = await db.emailAccount.findUnique({
+        where: { id },
+        select: { tokenVersion: true, status: true, errorMessage: true },
+    });
+    if (!current || current.status === 'DISABLED' || (tokenVersion !== undefined && tokenVersion !== current.tokenVersion)) return;
+
+    if (requiresReauthorization(errorMessage)) {
+        // Reauthorization is actionable account state, not a routine check result.
+        // It may supersede a concurrent ordinary status/error change, but never a
+        // credential rotation or a concurrently disabled account.
+        await db.emailAccount.updateMany({
+            where: {
+                id,
+                tokenVersion: current.tokenVersion,
+                status: { not: 'DISABLED' },
+            },
+            data: {
+                status: 'ERROR',
+                errorMessage: errorMessage || null,
+                lastCheckAt: new Date(),
+            },
+        });
+        return;
+    }
+
+    const update = statusUpdateDecision(current, { status, errorMessage });
+    await db.emailAccount.updateMany({
+        where: {
+            id,
+            tokenVersion: current.tokenVersion,
+            status: current.status,
+            errorMessage: current.errorMessage,
+        },
+        data: {
+            ...update,
+            lastCheckAt: new Date(),
+        },
+    });
+}
 
 export const emailService = {
     /**
@@ -60,6 +123,7 @@ export const emailService = {
                 clientId: true,
                 password: !!includeSecrets,
                 refreshToken: !!includeSecrets,
+                tokenVersion: true,
                 status: true,
                 groupId: true,
                 group: { select: { id: true, name: true, fetchStrategy: true } },
@@ -98,6 +162,7 @@ export const emailService = {
                 email: true,
                 clientId: true,
                 refreshToken: true,
+                tokenVersion: true,
                 password: true,
                 status: true,
                 groupId: true,
@@ -167,11 +232,14 @@ export const emailService = {
         }
 
         const { refreshToken, password, ...rest } = input;
-        const updateData: Prisma.EmailAccountUpdateInput = { ...rest };
+        const updateData: Prisma.EmailAccountUpdateInput = { ...rest, tokenVersion: { increment: 1 } };
 
         // 加密 sensitive data
         if (refreshToken) {
             updateData.refreshToken = encrypt(refreshToken);
+            updateData.tokenRefreshedAt = new Date();
+            updateData.errorMessage = null;
+            if (!rest.status) updateData.status = 'ACTIVE';
         }
         if (password) {
             updateData.password = encrypt(password);
@@ -195,15 +263,8 @@ export const emailService = {
     /**
      * 更新邮箱状态
      */
-    async updateStatus(id: number, status: 'ACTIVE' | 'ERROR' | 'DISABLED', errorMessage?: string | null) {
-        await prisma.emailAccount.update({
-            where: { id },
-            data: {
-                status,
-                errorMessage: errorMessage || null,
-                lastCheckAt: new Date(),
-            },
-        });
+    async updateStatus(id: number, status: EmailStatus, errorMessage?: string | null, tokenVersion?: number) {
+        await updateEmailStatusWithDb(prisma, id, status, errorMessage, tokenVersion);
     },
 
     /**
@@ -299,6 +360,9 @@ export const emailService = {
                 const data: Prisma.EmailAccountUncheckedUpdateInput = {
                     clientId,
                     refreshToken: encrypt(refreshToken),
+                    tokenVersion: { increment: 1 },
+                    tokenRefreshedAt: new Date(),
+                    errorMessage: null,
                     status: 'ACTIVE',
                 };
                 if (password) data.password = encrypt(password);

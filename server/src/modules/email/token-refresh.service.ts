@@ -1,5 +1,7 @@
 import prisma from '../../lib/prisma.js';
-import { encrypt, decrypt } from '../../lib/crypto.js';
+import { decrypt } from '../../lib/crypto.js';
+import { persistRotatedToken } from '../../lib/rotated-token.js';
+import { readMicrosoftError, requiresReauthorization } from '../../lib/microsoft-oauth.js';
 import { logger } from '../../lib/logger.js';
 import { proxyFetch } from '../../lib/proxy.js';
 import { env } from '../../config/env.js';
@@ -140,9 +142,9 @@ function formatTokenRefreshError(message: string): string {
     return `${TOKEN_REFRESH_ERROR_PREFIX}: ${message}`.substring(0, 500);
 }
 
-function getFailureUpdateData(existingErrorMessage: string | null, message: string) {
-    if (existingErrorMessage && !existingErrorMessage.startsWith(TOKEN_REFRESH_ERROR_PREFIX)) {
-        return {};
+function getFailureUpdateData(message: string) {
+    if (requiresReauthorization(message)) {
+        return { errorMessage: formatTokenRefreshError(message), status: 'ERROR' as const };
     }
 
     return {
@@ -150,7 +152,47 @@ function getFailureUpdateData(existingErrorMessage: string | null, message: stri
     };
 }
 
+export async function persistTokenRefreshFailure(
+    emailId: number,
+    tokenVersion: number,
+    message: string,
+    db: Pick<Prisma.TransactionClient, 'emailAccount'> = prisma,
+): Promise<void> {
+    const reauthorizationRequired = requiresReauthorization(message);
+    if (reauthorizationRequired) {
+        await db.emailAccount.updateMany({
+            where: { id: emailId, tokenVersion, status: { not: 'DISABLED' } },
+            data: getFailureUpdateData(message),
+        });
+        return;
+    }
+
+    const current = await db.emailAccount.findUnique({
+        where: { id: emailId },
+        select: { tokenVersion: true, status: true, errorMessage: true },
+    });
+    if (!current || current.tokenVersion !== tokenVersion || current.status === 'DISABLED') return;
+    if (requiresReauthorization(current.errorMessage)) return;
+    if (current.errorMessage && !current.errorMessage.startsWith(TOKEN_REFRESH_ERROR_PREFIX)) return;
+
+    // Compare the complete previous value. If any concurrent request changes
+    // account state, this routine failure is safely discarded rather than
+    // overwriting a more actionable result.
+    await db.emailAccount.updateMany({
+        where: {
+            id: emailId,
+            tokenVersion,
+            status: current.status,
+            errorMessage: current.errorMessage,
+        },
+        data: getFailureUpdateData(message),
+    });
+}
+
 function getSuccessUpdateData(existingErrorMessage: string | null) {
+    if (requiresReauthorization(existingErrorMessage)) {
+        return { errorMessage: null, status: 'ACTIVE' as const };
+    }
     if (existingErrorMessage?.startsWith(TOKEN_REFRESH_ERROR_PREFIX)) {
         return { errorMessage: null };
     }
@@ -326,6 +368,7 @@ export const tokenRefreshService = {
                 email: true,
                 clientId: true,
                 refreshToken: true,
+                tokenVersion: true,
                 status: true,
                 errorMessage: true,
             },
@@ -344,18 +387,16 @@ export const tokenRefreshService = {
             currentRefreshToken = decrypt(account.refreshToken);
         } catch {
             logger.error({ emailId, email: account.email }, '解密 refresh token 失败');
-            await prisma.emailAccount.update({
-                where: { id: emailId },
-                data: getFailureUpdateData(account.errorMessage, 'Failed to decrypt refresh token'),
-            });
+            await persistTokenRefreshFailure(emailId, account.tokenVersion, 'Failed to decrypt refresh token');
             return { emailId, email: account.email, success: false, message: 'Failed to decrypt refresh token' };
         }
 
         try {
             const response = await proxyFetch(
-                'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+                'https://login.microsoftonline.com/consumers/oauth2/v2.0/token',
                 {
                     method: 'POST',
+                    signal: AbortSignal.timeout(15000),
                     headers: {
                         'Content-Type': 'application/x-www-form-urlencoded',
                     },
@@ -368,20 +409,10 @@ export const tokenRefreshService = {
             );
 
             if (!response.ok) {
-                const errorText = await response.text();
-                let errorMsg = `HTTP ${response.status}`;
-                try {
-                    const errorJson = JSON.parse(errorText) as OAuthTokenResponse;
-                    errorMsg = errorJson.error_description || errorJson.error || errorMsg;
-                } catch {
-                    errorMsg = errorText.substring(0, 200);
-                }
-
-                logger.warn({ email: account.email, emailId, status: response.status }, `Token 刷新失败: ${errorMsg}`);
-                await prisma.emailAccount.update({
-                    where: { id: emailId },
-                    data: getFailureUpdateData(account.errorMessage, errorMsg),
-                });
+                const error = await readMicrosoftError(response);
+                const errorMsg = error.message;
+                logger.warn({ emailId, status: response.status, code: error.code }, 'Token 刷新失败');
+                await persistTokenRefreshFailure(emailId, account.tokenVersion, errorMsg);
                 return { emailId, email: account.email, success: false, message: errorMsg.substring(0, 200) };
             }
 
@@ -390,32 +421,22 @@ export const tokenRefreshService = {
             if (!data.refresh_token) {
                 const msg = 'No refresh_token in response';
                 logger.warn({ email: account.email, emailId }, '响应中缺少 refresh_token');
-                await prisma.emailAccount.update({
-                    where: { id: emailId },
-                    data: getFailureUpdateData(account.errorMessage, msg),
-                });
+                await persistTokenRefreshFailure(emailId, account.tokenVersion, msg);
                 return { emailId, email: account.email, success: false, message: msg };
             }
 
-            const encryptedNewToken = encrypt(data.refresh_token);
-            await prisma.emailAccount.update({
-                where: { id: emailId },
-                data: {
-                    refreshToken: encryptedNewToken,
-                    tokenRefreshedAt: new Date(),
-                    ...getSuccessUpdateData(account.errorMessage),
-                },
-            });
+            const saved = await persistRotatedToken(
+                { id: emailId, tokenVersion: account.tokenVersion, refreshToken: currentRefreshToken },
+                data.refresh_token, prisma, getSuccessUpdateData(account.errorMessage),
+            );
+            if (!saved) return { emailId, email: account.email, success: false, message: 'Account credentials changed; retry' };
 
             logger.info({ email: account.email, emailId }, 'Token 刷新成功');
             return { emailId, email: account.email, success: true, message: 'OK' };
-        } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : 'Unknown error';
-            logger.error({ err, email: account.email, emailId }, 'Token 刷新异常');
-            await prisma.emailAccount.update({
-                where: { id: emailId },
-                data: getFailureUpdateData(account.errorMessage, `Exception: ${message}`),
-            });
+        } catch {
+            const message = 'Token refresh network or persistence failure';
+            logger.error({ emailId }, 'Token 刷新异常');
+            await persistTokenRefreshFailure(emailId, account.tokenVersion, `Exception: ${message}`);
             return { emailId, email: account.email, success: false, message: message.substring(0, 200) };
         }
     },
@@ -456,11 +477,14 @@ export const tokenRefreshService = {
                 where.groupId = groupId;
             }
 
-            const accounts = await prisma.emailAccount.findMany({
+            const allAccounts = await prisma.emailAccount.findMany({
                 where,
-                select: { id: true },
+                select: { id: true, errorMessage: true },
                 orderBy: { id: 'asc' },
             });
+            const accounts = trigger === 'AUTO'
+                ? allAccounts.filter((account) => !requiresReauthorization(account.errorMessage))
+                : allAccounts;
 
             const config = await this.getTokenRefreshConfig();
             const concurrency = options?.concurrency || config.concurrency;
