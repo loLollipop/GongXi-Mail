@@ -19,9 +19,18 @@ const ID = '12345678-1234-4123-8123-123456789012';
 const SECOND_ID = '87654321-4321-4321-8321-210987654321';
 const UA = 'test-browser-agent';
 const CLEAR = 'test-only-mailbox-credential';
+const THUNDERBIRD_CLIENT_ID = '9e5f94bc-e8a4-4e73-b8be-63364c29d753';
 const submittedLogin = (runId: string, bindingId: string, now: number) => ({
     deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 2000 },
     emailSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', email: 'target@outlook.com', submittedAt: now - 1000 },
+});
+const submittedPasswordLogin = (runId: string, bindingId: string, now: number, clientId = 'client') => ({
+    deviceSubmission: { runId, sessionId: ID, bindingId, clientId, submittedAt: now - 2000 },
+    emailSubmission: { runId, sessionId: ID, bindingId, clientId, email: 'target@outlook.com', submittedAt: now - 1000 },
+    passwordSent: true,
+    actions: { device: true, email: true, password: true },
+    passwordSubmission: { runId, sessionId: ID, bindingId, clientId,
+        email: 'target@outlook.com', submittedAt: now - 500 },
 });
 
 async function runMicrosoftScenario(options: {
@@ -41,6 +50,21 @@ async function runMicrosoftScenario(options: {
     clickView?: 'empty' | 'device' | 'picker' | 'password-choice' | 'email' | 'password' | 'stay' | 'consent' | 'password-consent' | 'password-continue';
     entryHref?: string;
     currentStatus?: 'PENDING' | 'SUCCEEDED';
+    pickerText?: string;
+    identityText?: string;
+    consentAcceptCount?: number;
+    includeConsentReject?: boolean;
+    permissionText?: string;
+    permissionItems?: readonly string[];
+    permissionContainerPresent?: boolean;
+    permissionContainerText?: string;
+    pageText?: string;
+    hiddenClientIds?: readonly string[];
+    hiddenScopes?: readonly string[];
+    appNameTexts?: readonly string[];
+    headingTexts?: readonly string[];
+    linkTexts?: readonly string[];
+    linkForm?: 'accept' | 'none' | 'other';
     saveMutations?: Record<number, { url?: string; formAction?: string; formMethod?: string;
         submitFormAction?: string; submitFormMethod?: string }>;
 }) {
@@ -71,22 +95,35 @@ async function runMicrosoftScenario(options: {
         closest() { return this.form; }
         dispatchEvent() { return true; }
     }
-    const makeNode = (text = '') => ({
-        disabled: false, innerText: text, textContent: text, value: '',
+    const makeNode = (text = '', id = '') => ({
+        id, disabled: false, innerText: text, textContent: text, value: '',
         getClientRects: () => [{}], getAttribute: () => null,
+        matches: (selector: string) => selector.includes('button[type="submit"]'),
     });
     let activeView = options.view;
-    const identity = makeNode(activeView === 'picker' ? 'cached@outlook.com' : 'target@outlook.com');
+    const identity = makeNode(options.identityText ?? (activeView === 'picker' ? 'cached@outlook.com' : 'target@outlook.com'));
     const email = new TestInput();
     const password = new TestInput();
     const device = new TestInput();
-    const submitText = ['consent', 'password-consent'].includes(options.view ?? '') ? 'Accept' :
-        options.view === 'password-continue' || options.view === 'device' ? 'Continue' :
+    const submitText = options.view === 'password-continue' || options.view === 'device' ? 'Continue' :
             options.view === 'email' ? 'Next' : 'Sign in';
-    const submit = makeNode(submitText);
-    const picker = makeNode('Use another account');
+    const submit = makeNode(submitText, 'idSIButton9');
+    const picker = makeNode(options.pickerText ?? 'Use another account');
     const passwordOption = makeNode('Use your password');
     const no = makeNode('No');
+    const consentAccepts = Array.from({ length: options.consentAcceptCount ?? 1 }, () => makeNode('Accept', 'idSubmit_Consent'));
+    const consentReject = makeNode('Reject', 'idBtn_Reject');
+    const permissionItems = (options.permissionItems ?? ['Read and write access to your mail']).map((value) => makeNode(value));
+    const permissionContainer = makeNode(options.permissionContainerText ?? permissionItems.map((item) => item.innerText).join('\n'), 'permissionsList');
+    Object.assign(permissionContainer, {
+        querySelectorAll: (selector: string) => selector === 'li, [role="listitem"]' ? permissionItems : [],
+    });
+    const hiddenClientInputs = (options.hiddenClientIds ?? []).map((value) => ({ ...makeNode(), value }));
+    const hiddenScopeInputs = (options.hiddenScopes ?? []).map((value) => ({ ...makeNode(), value }));
+    const appNames = (options.appNameTexts ?? ['Mozilla Thunderbird']).map((value) => makeNode(value));
+    const headings = (options.headingTexts ?? (options.view === 'password-choice' ? ['Verify your email'] : []))
+        .map((value) => makeNode(value));
+    const links = (options.linkTexts ?? []).map((value) => makeNode(value));
     const submitAttributes: Record<string, string> = {};
     if (options.submitFormAction !== undefined) submitAttributes.formaction = options.submitFormAction;
     if (options.submitFormMethod !== undefined) submitAttributes.formmethod = options.submitFormMethod;
@@ -99,10 +136,16 @@ async function runMicrosoftScenario(options: {
             if (type === 'submit') submitListeners.push({ listener, once: !!settings?.once });
         },
     };
+    const otherForm = { action: parsed.href, method: 'post' };
+    for (const link of links) {
+        const linkForm = options.linkForm === 'none' ? null : options.linkForm === 'other' ? otherForm : form;
+        Object.assign(link, { form: linkForm, closest: () => linkForm });
+    }
     email.form = form;
     password.form = form;
     device.form = form;
     let clicks = 0;
+    let rejectClicks = 0;
     let clickReached: (() => void) | undefined;
     const reached = new Promise<void>((resolve) => { clickReached = resolve; });
     Object.assign(submit, {
@@ -123,6 +166,26 @@ async function runMicrosoftScenario(options: {
         if (options.clickView) activeView = options.clickView;
         if (clicks >= (options.stopAfterClicks ?? Number.POSITIVE_INFINITY)) clickReached?.();
         },
+    });
+    for (const accept of consentAccepts) {
+        Object.assign(accept, {
+            form,
+            formAction: options.submitFormAction ?? '',
+            formMethod: options.submitFormMethod ?? '',
+            getAttribute: (name: string) => submitAttributes[name] ?? null,
+            closest: () => form,
+            click: () => {
+                clicks++;
+                if (options.clickView) activeView = options.clickView;
+                if (clicks >= (options.stopAfterClicks ?? Number.POSITIVE_INFINITY)) clickReached?.();
+            },
+        });
+    }
+    Object.assign(consentReject, {
+        form,
+        getAttribute: () => null,
+        closest: () => form,
+        click: () => { rejectClicks++; },
     });
     Object.assign(picker, {
         click: () => {
@@ -149,18 +212,39 @@ async function runMicrosoftScenario(options: {
             if (clicks >= (options.stopAfterClicks ?? Number.POSITIVE_INFINITY)) clickReached?.();
         },
     });
-    const bodyText = () => ['consent', 'password-consent'].includes(activeView ?? '') ? 'Permissions requested by this app' :
-        activeView === 'password-continue' ? 'Continue signing in to this app' : activeView === 'stay' ? 'Stay signed in?' : '';
+    const bodyText = () => options.pageText ?? (['consent', 'password-consent'].includes(activeView ?? '')
+        ? (options.permissionText ?? 'Mozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail') :
+        activeView === 'password-choice' ? headings.map((heading) => heading.innerText).join('\n') :
+        activeView === 'password-continue' ? 'Continue signing in to this app' : activeView === 'stay' ? 'Stay signed in?' : '');
     const querySelectorAll = (selector: string) => {
         if (selector.startsWith('#displayName,')) return ['picker', 'password', 'stay', 'consent', 'password-consent', 'password-continue'].includes(activeView ?? '') ? [identity] : [];
         if (selector === '#i0116[name="loginfmt"], #usernameEntry[type="email"][autocomplete~="username"]') return activeView === 'email' ? [email] : [];
         if (selector === 'input#i0118[name="passwd"][type="password"], #passwordEntry[type="password"], input[type="password"][autocomplete="current-password"]') return ['password', 'password-consent', 'password-continue'].includes(activeView ?? '') ? [password] : [];
         if (selector === '#otc, input[name="user_code"]') return activeView === 'device' ? [device] : [];
-        if (selector === '#idSIButton9, #idSubmit_Consent, #idBtn_Accept, form button[type="submit"]') return ['empty', 'picker'].includes(activeView ?? '') ? [] : [submit];
-        if (selector === '#otherTile, #idDiv_UseAnotherAccount') return activeView === 'picker' ? [picker] : [];
+        if (selector === '#idSIButton9, #idSubmit_Consent, #idBtn_Accept, form button[type="submit"], form input[type="submit"], button, input[type="button"], [role="button"]') {
+            if (['consent', 'password-consent'].includes(activeView ?? '')) return [...consentAccepts, ...(options.includeConsentReject ? [consentReject] : []),
+                ...(activeView === 'password-consent' ? [submit] : [])];
+            return ['empty', 'picker'].includes(activeView ?? '') ? [] : [submit];
+        }
+        if (selector === '#otherTile, #idDiv_UseAnotherAccount, button, a, [role="button"]') return activeView === 'picker' ? [picker] : [];
         if (selector === 'button, a, [role="button"]') return activeView === 'password-choice' ? [passwordOption] : [];
         if (selector === 'button, input[type="button"], input[type="submit"]') return activeView === 'stay' ? [no] : [];
-        if (selector.startsWith('#idDiv_SAOTCS_Proofs,')) return activeView === 'password-choice' ? [makeNode('verification')] : [];
+        if (selector === '#idDiv_SAOTCS_Proofs' || selector.startsWith('#idDiv_SAOTCS_Proofs,')) {
+            return activeView === 'password-choice' ? [makeNode('verification')] : [];
+        }
+        if (selector === '#permissionsList, #idDiv_ConsentScopes') {
+            return ['consent', 'password-consent'].includes(activeView ?? '') && options.permissionContainerPresent !== false
+                ? [permissionContainer] : [];
+        }
+        if (selector.startsWith('#permissionsList li,')) {
+            return ['consent', 'password-consent'].includes(activeView ?? '') ? permissionItems : [];
+        }
+        if (selector === 'input[name="client_id"]') return hiddenClientInputs;
+        if (selector === 'input[name="scope"]') return hiddenScopeInputs;
+        if (selector.startsWith('#appDisplayName,')) return ['consent', 'password-consent'].includes(activeView ?? '') ? appNames : [];
+        if (selector === 'h1, h2, h3, h4, [role="heading"]') return headings;
+        if (selector === '#idDiv_Consent a, #idDiv_ConsentHeader a, form a') return links;
+        if (selector === 'a') return links;
         return [];
     };
     const makeElement = () => ({
@@ -209,10 +293,12 @@ async function runMicrosoftScenario(options: {
                 if (mutation?.submitFormAction !== undefined) {
                     submitAttributes.formaction = mutation.submitFormAction;
                     Object.assign(submit, { formAction: mutation.submitFormAction });
+                    for (const accept of consentAccepts) Object.assign(accept, { formAction: mutation.submitFormAction });
                 }
                 if (mutation?.submitFormMethod !== undefined) {
                     submitAttributes.formmethod = mutation.submitFormMethod;
                     Object.assign(submit, { formMethod: mutation.submitFormMethod });
+                    for (const accept of consentAccepts) Object.assign(accept, { formMethod: mutation.submitFormMethod });
                 }
                 if (options.interruptSaveAfterClick && clicks > 0) return;
                 if (options.interruptSaveAfterClick) durableTabState = structuredClone(value);
@@ -268,7 +354,7 @@ async function runMicrosoftScenario(options: {
     const execution = moduleValue.exports.microsoftMain();
     if (options.stopAfterClicks) await Promise.race([execution, reached]);
     else await execution;
-    return { requests, clicks, submitEvents, inputValues: { device: device.value, email: email.value, password: password.value },
+    return { requests, clicks, rejectClicks, submitEvents, inputValues: { device: device.value, email: email.value, password: password.value },
         handoffEvents, tabState: durableTabState, values };
 }
 
@@ -1137,6 +1223,31 @@ void test('a passwordless-first verification page chooses the explicit password 
     assert.equal(result.clicks, 1);
 });
 
+for (const challenge of ['Recover your account', 'captcha', 'Authenticator'] as const) {
+    void test(`a ${challenge} challenge pauses even when a password option is present`, async () => {
+        const now = Date.now();
+        const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+        const result = await runMicrosoftScenario({
+            url: 'https://login.live.com/oauth20_remoteconnect.srf',
+            view: 'password-choice',
+            pageText: challenge,
+            headingTexts: [challenge],
+            tabTask: {
+                runId, sessionId: ID, bindingId, boundAt: now - 3000, expiresAt: now + 60000,
+                capability: 'c'.repeat(43), actions: { device: true, email: true },
+                ...submittedLogin(runId, bindingId, now),
+            },
+            values: {
+                'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+                'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+            },
+        });
+        assert.deepEqual(result.requests, ['current']);
+        assert.equal(result.clicks, 0);
+    });
+}
+
 void test('a password alternative with an untrusted entry target pauses', async () => {
     const now = Date.now();
     const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -1169,9 +1280,7 @@ void test('the current stay-signed-in layout chooses the explicit negative optio
         stopAfterClicks: 1,
         tabTask: {
             runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
-            capability: 'c'.repeat(43), passwordSent: true,
-            actions: { device: true, email: true, password: true },
-            ...submittedLogin(runId, bindingId, now),
+            capability: 'c'.repeat(43), ...submittedPasswordLogin(runId, bindingId, now),
         },
         values: {
             'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
@@ -1180,6 +1289,7 @@ void test('the current stay-signed-in layout chooses the explicit negative optio
     });
     assert.deepEqual(result.requests, ['current']);
     assert.equal(result.clicks, 1);
+    assert.equal(result.rejectClicks, 0);
 });
 
 void test('a cached matching password page pauses until this bound flow submitted the queued email', async () => {
@@ -1311,8 +1421,10 @@ void test('a password click that does not navigate is cleared when the resulting
         url: 'https://login.microsoftonline.com/common/login',
         view: 'password',
         clickView: 'consent',
+        permissionText: 'Permissions requested by this app\nRead and write access to your mail',
         tabTask: {
-            runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
+            runId, sessionId: ID, bindingId, boundAt: now - 3000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), actions: { device: true, email: true },
             ...submittedLogin(runId, bindingId, now),
         },
         values: {
@@ -1434,6 +1546,314 @@ void test('a submitted device-code proof cannot authorize consent for an unrelat
     assert.equal(result.clicks, 0, 'consent cannot be tied to the expected device-code application');
 });
 
+for (const [pickerText, expectedAction] of [
+    ['通过其他 Microsoft 帐户登录', 'choose-other-microsoft'],
+    ['使用其他帐户登录', 'choose-other'],
+] as const) {
+    void test(`the account picker accepts only the explicit Chinese entry: ${pickerText}`, async () => {
+        const now = Date.now();
+        const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+        const result = await runMicrosoftScenario({
+            url: 'https://login.microsoftonline.com/common/login', view: 'picker', pickerText, stopAfterClicks: 1,
+            tabTask: { runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43),
+                actions: { device: true }, deviceSubmission: submittedLogin(runId, bindingId, now).deviceSubmission },
+            values: {
+                'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+                'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+            },
+        });
+        assert.equal(result.clicks, 1);
+        assert.equal((result.tabState.gongxiHelper as { actions?: Record<string, boolean> }).actions?.[expectedAction], true);
+    });
+}
+
+void test('the two consecutive other-account pages use separate one-shot actions', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/login', view: 'picker', pickerText: '使用其他帐户登录',
+        stopAfterClicks: 1,
+        tabTask: { runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43),
+            actions: { device: true, 'choose-other-microsoft': true },
+            deviceSubmission: submittedLogin(runId, bindingId, now).deviceSubmission },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.equal(result.clicks, 1);
+    assert.equal((result.tabState.gongxiHelper as { actions?: Record<string, boolean> }).actions?.['choose-other'], true);
+});
+
+void test('a fully proven consent with an explicit Thunderbird application component clicks the unique Accept and never Reject', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', view: 'consent', stopAfterClicks: 1,
+        includeConsentReject: true,
+        currentClientId: THUNDERBIRD_CLIENT_ID,
+        hiddenClientIds: [THUNDERBIRD_CLIENT_ID],
+        hiddenScopes: ['openid profile offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.ReadWrite'],
+        appNameTexts: ['Mozilla Thunderbird'],
+        permissionItems: ['Read and write access to your mail'],
+        tabTask: { runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), ...submittedPasswordLogin(runId, bindingId, now, THUNDERBIRD_CLIENT_ID) },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 1);
+    assert.equal(result.rejectClicks, 0);
+});
+
+void test('consent pauses when the supported permission container is missing despite otherwise valid evidence', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', view: 'consent',
+        currentClientId: THUNDERBIRD_CLIENT_ID,
+        permissionText: 'Mozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail',
+        permissionItems: ['Read and write access to your mail'],
+        permissionContainerPresent: false,
+        tabTask: { runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), ...submittedPasswordLogin(runId, bindingId, now, THUNDERBIRD_CLIENT_ID) },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 0);
+});
+
+void test('consent pauses when permission nodes only partially cover the supported container text', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', view: 'consent',
+        currentClientId: THUNDERBIRD_CLIENT_ID,
+        permissionText: 'Mozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail\nRead your tasks',
+        permissionItems: ['Read and write access to your mail'],
+        permissionContainerText: 'Read and write access to your mail\nRead your tasks',
+        tabTask: { runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), ...submittedPasswordLogin(runId, bindingId, now, THUNDERBIRD_CLIENT_ID) },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 0);
+});
+
+void test('the current Chinese Thunderbird permission wording and its explicit no-send clause are accepted', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    for (const noSendText of ['不包括发送邮件的权限', '不包括发送邮件权限']) {
+        const permission = `你的邮件的读写访问权限\nThunderbird 将能够读取、更新、创建和删除邮箱中的电子邮件。${noSendText}。`;
+        const result = await runMicrosoftScenario({
+            url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', view: 'consent', stopAfterClicks: 1,
+            currentClientId: THUNDERBIRD_CLIENT_ID,
+            includeConsentReject: true,
+            permissionText: `Mozilla Thunderbird\n此应用请求的权限\n${permission}\n接受后，即表示你允许此应用按照其服务条款和隐私声明使用你的信息。\n服务条款\n隐私声明`,
+            permissionItems: [permission],
+            tabTask: { runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
+                capability: 'c'.repeat(43), ...submittedPasswordLogin(runId, bindingId, now, THUNDERBIRD_CLIENT_ID) },
+            values: {
+                'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+                'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+            },
+        });
+        assert.equal(result.clicks, 1);
+        assert.equal(result.rejectClicks, 0);
+    }
+});
+
+void test('the legacy Chinese consent layout shown in production is accepted through its scoped Thunderbird link', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const permission = '你的邮件的读写访问权限\nThunderbird 将能够读取、更新、创建和删除邮箱中的电子邮件。不包括发送邮件的权限。';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', view: 'consent', stopAfterClicks: 1,
+        currentClientId: THUNDERBIRD_CLIENT_ID, includeConsentReject: true,
+        appNameTexts: [], linkTexts: ['Mozilla Thunderbird'],
+        headingTexts: ['是否允许此应用访问你的信息?(1 个应用，共 1 个)'],
+        pageText: [
+            'Microsoft', 'target@outlook.com', '是否允许此应用访问你的信息?(1 个应用，共 1 个)',
+            'Mozilla Thunderbird', 'Thunderbird 需要得到你的许可才能执行以下操作:', permission,
+            '接受这些权限即表明你允许此应用按照服务条款和隐私声明中的相关规定使用你的数据。',
+            '发布者未提供条款链接供你查看。',
+            '你可以在 https://microsoft.com/consent 更改这些权限。',
+            '显示详细信息', '拒绝', '接受', '退出登录', '使用条款', '隐私和 cookie',
+            '如果这不是你的设备，请使用专用浏览。', '了解详细信息',
+        ].join('\n'),
+        permissionItems: [permission],
+        tabTask: { runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), ...submittedPasswordLogin(runId, bindingId, now, THUNDERBIRD_CLIENT_ID) },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 1);
+    assert.equal(result.rejectClicks, 0);
+});
+
+for (const scenario of [
+    { name: 'wrong identity', options: { identityText: 'other@outlook.com' } },
+    { name: 'missing password proof', options: {}, omitPasswordProof: true },
+    { name: 'external action', options: { formAction: 'https://evil.example/consent' } },
+    { name: 'GET action', options: { formMethod: 'get' } },
+    { name: 'wrong hidden client_id', options: { hiddenClientIds: ['other-client'] } },
+    { name: 'explicit empty scope', options: { hiddenScopes: [''] } },
+    { name: 'mixed empty and valid scope', options: { hiddenScopes: ['', 'openid profile offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.ReadWrite'] } },
+    { name: 'Mail.Read without Mail.ReadWrite', options: { hiddenScopes: ['openid profile https://graph.microsoft.com/Mail.Read'] } },
+    { name: 'unknown permission', options: { permissionItems: ['Read and write access to your mail', 'Launch rockets'] } },
+    { name: 'Join calls permission outside the supported container', options: {
+        permissionText: 'Mozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail\nJoin calls on your behalf',
+        permissionItems: ['Read and write access to your mail'],
+        permissionContainerText: 'Read and write access to your mail',
+    } },
+    { name: 'Send mail permission outside the supported container', options: {
+        permissionText: 'Mozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail\nSend mail as you',
+        permissionItems: ['Read and write access to your mail'],
+        permissionContainerText: 'Read and write access to your mail',
+    } },
+    { name: 'Join calls text omitted from extracted permission nodes', options: {
+        permissionText: 'Mozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail\nJoin calls on your behalf',
+        permissionItems: ['Read and write access to your mail'],
+        permissionContainerText: 'Read and write access to your mail\nJoin calls on your behalf',
+    } },
+    { name: 'Record meetings text omitted from extracted permission nodes', options: {
+        permissionText: 'Mozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail\nRecord your meetings',
+        permissionItems: ['Read and write access to your mail'],
+        permissionContainerText: 'Read and write access to your mail\nRecord your meetings',
+    } },
+    { name: 'Mail.Send permission', options: { permissionItems: ['Read and write access to your mail', 'Send mail as you'] } },
+    { name: 'contacts permission', options: { permissionItems: ['Read and write access to your mail', 'Read your contacts'] } },
+    { name: 'calendar permission', options: { permissionItems: ['Read and write access to your mail', 'Read your calendars'] } },
+    { name: 'files permission', options: { permissionItems: ['Read and write access to your mail', 'Read your files'] } },
+    { name: 'administrator permission', options: { permissionItems: ['Read and write access to your mail', 'Act as an administrator'] } },
+    { name: 'permission text mixed into the identity component', options: {
+        identityText: 'target@outlook.com\nJoin calls on your behalf',
+        permissionText: 'Mozilla Thunderbird\nPermissions requested by this app\ntarget@outlook.com\nJoin calls on your behalf\nRead and write access to your mail',
+    } },
+    { name: 'Mail.Send text mixed into the identity component', options: {
+        identityText: 'target@outlook.com\nSend mail as you',
+        permissionText: 'Mozilla Thunderbird\nPermissions requested by this app\ntarget@outlook.com\nSend mail as you\nRead and write access to your mail',
+    } },
+    { name: 'multiple Accept controls', options: { consentAcceptCount: 2 } },
+    { name: 'contradictory application components', options: { appNameTexts: ['Mozilla Thunderbird', 'OtherApp'] } },
+    { name: 'an empty second application component', options: { appNameTexts: ['Mozilla Thunderbird', ''] } },
+    { name: 'multiple empty application components', options: { appNameTexts: ['', ''] } },
+    { name: 'OtherApp title plus unrelated Thunderbird link', options: {
+        appNameTexts: [], headingTexts: ['OtherApp needs your permission'], linkTexts: ['Thunderbird'],
+        permissionText: 'OtherApp needs your permission\nThunderbird\nPermissions requested by this app\nRead and write access to your mail',
+    } },
+    { name: 'Thunderbird link outside the Accept form', options: {
+        appNameTexts: [], headingTexts: ['是否允许此应用访问你的信息?(1 个应用，共 1 个)'],
+        linkTexts: ['Mozilla Thunderbird'], linkForm: 'none',
+        permissionText: '是否允许此应用访问你的信息?(1 个应用，共 1 个)\nMozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail',
+    } },
+    { name: 'Thunderbird link in another form', options: {
+        appNameTexts: [], headingTexts: ['是否允许此应用访问你的信息?(1 个应用，共 1 个)'],
+        linkTexts: ['Mozilla Thunderbird'], linkForm: 'other',
+        permissionText: '是否允许此应用访问你的信息?(1 个应用，共 1 个)\nMozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail',
+    } },
+    { name: 'duplicate generic consent headings', options: {
+        appNameTexts: [], headingTexts: ['是否允许此应用访问你的信息?(1 个应用，共 1 个)', '是否允许此应用访问你的信息?(1 个应用，共 1 个)'],
+        linkTexts: ['Mozilla Thunderbird'],
+        permissionText: '是否允许此应用访问你的信息?(1 个应用，共 1 个)\n是否允许此应用访问你的信息?(1 个应用，共 1 个)\nMozilla Thunderbird\nPermissions requested by this app\nRead and write access to your mail',
+    } },
+] as const) {
+    void test(`consent pauses for ${scenario.name}`, async () => {
+        const now = Date.now();
+        const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+        const result = await runMicrosoftScenario({
+            url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', view: 'consent',
+            currentClientId: THUNDERBIRD_CLIENT_ID,
+            hiddenClientIds: [THUNDERBIRD_CLIENT_ID],
+            hiddenScopes: ['openid profile offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.ReadWrite'],
+            permissionItems: ['Read and write access to your mail'],
+            ...scenario.options,
+            tabTask: { runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
+                capability: 'c'.repeat(43), ...('omitPasswordProof' in scenario && scenario.omitPasswordProof
+                    ? { actions: { device: true, email: true },
+                        deviceSubmission: { runId, sessionId: ID, bindingId, clientId: THUNDERBIRD_CLIENT_ID, submittedAt: now - 2000 },
+                        emailSubmission: { runId, sessionId: ID, bindingId, clientId: THUNDERBIRD_CLIENT_ID,
+                            email: 'target@outlook.com', submittedAt: now - 1000 } }
+                    : submittedPasswordLogin(runId, bindingId, now, THUNDERBIRD_CLIENT_ID)) },
+            values: {
+                'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+                'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+            },
+        });
+        assert.deepEqual(result.requests, ['current']);
+        assert.equal(result.clicks, 0);
+        assert.equal(result.rejectClicks, 0);
+    });
+}
+
+void test('consent target action changes are caught by final recapture', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', view: 'consent',
+        currentClientId: THUNDERBIRD_CLIENT_ID,
+        permissionItems: ['Read and write access to your mail'],
+        saveMutations: { 1: { formAction: 'https://login.microsoftonline.com/common/changed' } },
+        tabTask: { runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), ...submittedPasswordLogin(runId, bindingId, now, THUNDERBIRD_CLIENT_ID) },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.equal(result.clicks, 0);
+    assert.equal(result.rejectClicks, 0);
+});
+
+for (const mutation of [
+    { name: 'formaction', initial: { submitFormAction: 'https://login.microsoftonline.com/common/consent' },
+        changed: { submitFormAction: 'https://evil.example/collect' } },
+    { name: 'formmethod', initial: { submitFormMethod: 'post' }, changed: { submitFormMethod: 'get' } },
+] as const) {
+    void test(`an Accept ${mutation.name} change is reflected by the harness and caught by final recapture`, async () => {
+        const now = Date.now();
+        const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+        const result = await runMicrosoftScenario({
+            url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', view: 'consent',
+            currentClientId: THUNDERBIRD_CLIENT_ID,
+            includeConsentReject: true,
+            permissionItems: ['Read and write access to your mail'],
+            ...mutation.initial,
+            saveMutations: { 1: mutation.changed },
+            tabTask: { runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
+                capability: 'c'.repeat(43), ...submittedPasswordLogin(runId, bindingId, now, THUNDERBIRD_CLIENT_ID) },
+            values: {
+                'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+                'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+            },
+        });
+        assert.deepEqual(result.requests, ['current']);
+        assert.equal(result.clicks, 0);
+        assert.equal(result.rejectClicks, 0);
+    });
+}
+
 void test('userscript policy pauses challenges, unknown identities and stale controls; grants stay narrow', async () => {
     const source = await readFile(new URL('../../../../web/public/gongxi-mail-reauthorization.user.js', import.meta.url), 'utf8');
     const sandbox = { URL, URLSearchParams, btoa, atob, JSON, module: { exports: {} as {
@@ -1444,6 +1864,7 @@ void test('userscript policy pauses challenges, unknown identities and stale con
         bootstrapTarget: (session: Record<string, unknown>, bindingId: string, runId: string) => string | null;
         recoverSubmissionProofs: (stored: Record<string, unknown>, progress: Record<string, unknown>,
             expectedEmail: string, expectedClientId: string, now: number) => Record<string, unknown> | null;
+        submittedPassword: (progress: Record<string, unknown>, expectedEmail: string, expectedClientId: string) => boolean;
         workerRequiresPause: (control: Record<string, unknown>, worker: Record<string, unknown>, now: number) => boolean;
         workerConfirmedFreshLogin: (control: Record<string, unknown>, worker: Record<string, unknown>, now: number) => boolean;
         manualSuccessConfirmed: (control: Record<string, unknown>, session: Record<string, unknown>, now: number) => boolean;
@@ -1453,6 +1874,12 @@ void test('userscript policy pauses challenges, unknown identities and stale con
     const deviceSubmission = { runId: 'r', sessionId: ID, bindingId: 'b', clientId: 'client', submittedAt: 1500 };
     const submitted = { runId: 'r', sessionId: ID, bindingId: 'b', deviceSubmission,
         emailSubmission: { runId: 'r', sessionId: ID, bindingId: 'b', clientId: 'client', email: 'target@outlook.com', submittedAt: 1600 } };
+    const fullSubmitted = { ...submitted, passwordSent: true, actions: { password: true },
+        passwordSubmission: { runId: 'r', sessionId: ID, bindingId: 'b', clientId: 'client',
+            email: 'target@outlook.com', submittedAt: 1700 } };
+    assert.equal(policy.submittedPassword(fullSubmitted, 'TARGET@outlook.com', 'client'), true);
+    assert.equal(policy.submittedPassword({ ...fullSubmitted, passwordSubmission: {
+        ...fullSubmitted.passwordSubmission, submittedAt: 1500 } }, 'target@outlook.com', 'client'), false);
     assert.equal(policy.decide({ identities: [], password: true, clientIds: ['client'] }, 'target@outlook.com', 'client', {}), 'pause');
     assert.equal(policy.decide({ identities: ['target@outlook.com'], password: true, clientIds: ['client'] }, 'TARGET@outlook.com', 'client', {}), 'pause');
     assert.equal(policy.decide({ identities: ['target@outlook.com'], password: true, clientIds: [] }, 'TARGET@outlook.com', 'client', submitted), 'password');
@@ -1461,7 +1888,7 @@ void test('userscript policy pauses challenges, unknown identities and stale con
     assert.equal(policy.decide({ identities: ['target@outlook.com'], password: true, clientIds: ['client'] }, 'TARGET@outlook.com', 'client',
         { ...submitted, deviceSubmission: { ...deviceSubmission, clientId: 'tampered' } }), 'pause');
     assert.equal(policy.decide({ identities: ['other@outlook.com'], password: true, clientIds: ['client'] }, 'target@outlook.com', 'client', {}), 'mismatch');
-    assert.equal(policy.decide({ identities: ['cached@outlook.com'], picker: true, clientIds: [] }, 'target@outlook.com', 'client',
+    assert.equal(policy.decide({ identities: ['cached@outlook.com'], picker: true, pickerAction: 'choose-other', clientIds: [] }, 'target@outlook.com', 'client',
         { ...submitted, emailSubmission: undefined }), 'choose-other');
     for (const field of ['challenge', 'error']) assert.equal(policy.decide({ identities: [], device: true, devicePath: true, [field]: true }, 'a@b.com', 'client', {}), 'pause');
     assert.equal(policy.decide({ identities: [], email: true, clientIds: ['client'] }, 'a@b.com', 'client', { ...submitted, identityVerified: true }), 'email');
@@ -1470,6 +1897,19 @@ void test('userscript policy pauses challenges, unknown identities and stale con
         assert.equal(policy.decide({ identities: [], [field]: true, clientIds: ['client'] }, 'a@b.com', 'client', { ...submitted, identityVerified: true }), 'pause');
         assert.equal(policy.decide({ identities: ['a@b.com'], [field]: true, clientIds: ['client'] }, 'a@b.com', 'client', submitted), 'pause');
     }
+    const consentView = { identities: ['target@outlook.com'], consent: true, consentAccept: true,
+        consentAcceptCount: 1, permissionsExpected: true, permissionsEnumerated: true,
+        permissionsUnexpected: false, applicationThunderbird: true, clientIds: [], scopes: [] };
+    const currentNow = Date.now();
+    const currentPasswordProof = submittedPasswordLogin('r', 'b', currentNow, THUNDERBIRD_CLIENT_ID);
+    const currentProgress = { ...currentPasswordProof, runId: 'r', sessionId: ID, bindingId: 'b',
+        boundAt: currentNow - 3000, expiresAt: currentNow + 3000 };
+    for (const field of ['device', 'email', 'password', 'passwordOption', 'picker']) {
+        assert.equal(policy.decide({ ...consentView, [field]: true }, 'target@outlook.com', THUNDERBIRD_CLIENT_ID, currentProgress), 'pause');
+    }
+    assert.equal(policy.decide(consentView, 'target@outlook.com', THUNDERBIRD_CLIENT_ID, {
+        ...currentProgress, passwordSubmission: { ...currentProgress.passwordSubmission, submittedAt: currentNow + 1000 },
+    }), 'pause');
     const proofTask = { ...submitted, boundAt: 1000, expiresAt: 5000, actions: { device: true, email: true } };
     const storedProof = { version: 1, runId: 'r', sessionId: ID, bindingId: 'b', clientId: 'client',
         email: 'target@outlook.com', boundAt: 1000, expiresAt: 5000, deviceSubmission,
