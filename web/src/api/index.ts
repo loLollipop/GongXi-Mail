@@ -513,6 +513,12 @@ export const emailApi = {
     getById: <T = Record<string, unknown>>(id: number, includeSecrets?: boolean) =>
         requestGet<T>(`/admin/emails/${id}`, { params: { secrets: includeSecrets } }),
 
+    getPassword: (id: number) =>
+        requestGet<{ password: string | null }>(`/admin/emails/${id}/password`, {
+            cacheMs: 0,
+            dedupe: false,
+        }),
+
     create: (data: { email: string; clientId: string; refreshToken: string; password?: string; groupId?: number }) =>
         requestPost<Record<string, unknown>, { email: string; clientId: string; refreshToken: string; password?: string; groupId?: number }>(
             '/admin/emails',

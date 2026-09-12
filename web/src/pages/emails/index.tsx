@@ -29,10 +29,13 @@ import {
     MailOutlined,
     GroupOutlined,
     SyncOutlined,
+    CopyOutlined,
 } from '@ant-design/icons';
 import { emailApi, groupApi } from '../../api';
 import { getErrorMessage } from '../../utils/error';
 import { requestData } from '../../utils/request';
+import { useAuthStore } from '../../stores/authStore';
+import { isSuperAdmin } from '../../utils/auth';
 import dayjs from 'dayjs';
 
 const { Title, Text } = Typography;
@@ -92,10 +95,12 @@ interface MailItem {
 }
 
 interface EmailDetailsResult extends EmailAccount {
-    refreshToken: string;
+    refreshToken?: string;
 }
 
 const EmailsPage: React.FC = () => {
+    const admin = useAuthStore((state) => state.admin);
+    const hasSuperAdminPermission = isSuperAdmin(admin?.role);
     const [loading, setLoading] = useState(false);
     const [data, setData] = useState<EmailAccount[]>([]);
     const [total, setTotal] = useState(0);
@@ -121,6 +126,10 @@ const EmailsPage: React.FC = () => {
     const [emailDetailContent, setEmailDetailContent] = useState<string>('');
     const [emailDetailSubject, setEmailDetailSubject] = useState<string>('');
     const [emailEditLoading, setEmailEditLoading] = useState(false);
+    const [passwordModalVisible, setPasswordModalVisible] = useState(false);
+    const [passwordLoading, setPasswordLoading] = useState(false);
+    const [revealedPassword, setRevealedPassword] = useState<string | null | undefined>(undefined);
+    const [passwordTargetEmail, setPasswordTargetEmail] = useState('');
     const [form] = Form.useForm();
 
     // Group-related state
@@ -133,6 +142,11 @@ const EmailsPage: React.FC = () => {
     const [refreshingTokenIds, setRefreshingTokenIds] = useState<Set<number>>(new Set());
     const [batchRefreshing, setBatchRefreshing] = useState(false);
     const latestListRequestIdRef = useRef(0);
+    const passwordRequestIdRef = useRef(0);
+
+    useEffect(() => () => {
+        passwordRequestIdRef.current += 1;
+    }, []);
 
     const toOptionalNumber = (value: unknown): number | undefined => {
         if (value === undefined || value === null || value === '') {
@@ -207,7 +221,7 @@ const EmailsPage: React.FC = () => {
         form.resetFields();
         setModalVisible(true);
         try {
-            const res = await emailApi.getById<EmailDetailsResult>(record.id, true);
+            const res = await emailApi.getById<EmailDetailsResult>(record.id, hasSuperAdminPermission);
             if (res.code === 200) {
                 const details = res.data;
                 form.setFieldsValue({
@@ -223,7 +237,56 @@ const EmailsPage: React.FC = () => {
         } finally {
             setEmailEditLoading(false);
         }
-    }, [form]);
+    }, [form, hasSuperAdminPermission]);
+
+    const clearPasswordModal = useCallback(() => {
+        passwordRequestIdRef.current += 1;
+        setPasswordModalVisible(false);
+        setPasswordLoading(false);
+        setRevealedPassword(undefined);
+        setPasswordTargetEmail('');
+    }, []);
+
+    const handleRevealPassword = useCallback(async (record: EmailAccount) => {
+        const requestId = ++passwordRequestIdRef.current;
+        setRevealedPassword(undefined);
+        setPasswordTargetEmail(record.email);
+        setPasswordLoading(true);
+        setPasswordModalVisible(true);
+
+        try {
+            const response = await emailApi.getPassword(record.id);
+            if (requestId !== passwordRequestIdRef.current) return;
+            if (response.code !== 200) {
+                setRevealedPassword(undefined);
+                setPasswordTargetEmail('');
+                setPasswordModalVisible(false);
+                message.error(response.message || '查看密码失败');
+                return;
+            }
+            setRevealedPassword(response.data.password);
+        } catch (err: unknown) {
+            if (requestId !== passwordRequestIdRef.current) return;
+            setRevealedPassword(undefined);
+            setPasswordTargetEmail('');
+            setPasswordModalVisible(false);
+            message.error(getErrorMessage(err, '查看密码失败'));
+        } finally {
+            if (requestId === passwordRequestIdRef.current) {
+                setPasswordLoading(false);
+            }
+        }
+    }, []);
+
+    const handleCopyPassword = useCallback(async () => {
+        if (!revealedPassword) return;
+        try {
+            await navigator.clipboard.writeText(revealedPassword);
+            message.success('密码已复制');
+        } catch {
+            message.error('复制失败，请手动复制');
+        }
+    }, [revealedPassword]);
 
     const handleDelete = useCallback(async (id: number) => {
         try {
@@ -268,8 +331,11 @@ const EmailsPage: React.FC = () => {
                 values.groupId === null ? null : toOptionalNumber(values.groupId);
 
             if (editingId) {
+                const { password, refreshToken, ...nonCredentialValues } = values;
                 const submitData = {
-                    ...values,
+                    ...nonCredentialValues,
+                    ...(typeof password === 'string' && password.trim() ? { password } : {}),
+                    ...(typeof refreshToken === 'string' && refreshToken.trim() ? { refreshToken } : {}),
                     groupId: normalizedGroupId ?? null,
                 };
                 const res = await emailApi.update(editingId, submitData);
@@ -614,7 +680,7 @@ const EmailsPage: React.FC = () => {
         {
             title: '操作',
             key: 'action',
-            width: 240,
+            width: hasSuperAdminPermission ? 300 : 240,
             render: (_: unknown, record: EmailAccount) => (
                 <Space>
                     <Tooltip title="刷新 Token">
@@ -646,6 +712,11 @@ const EmailsPage: React.FC = () => {
                             onClick={() => handleEdit(record)}
                         />
                     </Tooltip>
+                    {hasSuperAdminPermission && (
+                        <Button type="link" size="small" onClick={() => handleRevealPassword(record)}>
+                            查看密码
+                        </Button>
+                    )}
                     <Tooltip title="删除">
                         <Popconfirm
                             title="确定要删除此邮箱吗？"
@@ -657,7 +728,7 @@ const EmailsPage: React.FC = () => {
                 </Space>
             ),
         },
-    ], [handleDelete, handleEdit, handleRefreshToken, handleViewMails, refreshingTokenIds]);
+    ], [handleDelete, handleEdit, handleRefreshToken, handleRevealPassword, handleViewMails, hasSuperAdminPermission, refreshingTokenIds]);
 
     const rowSelection = useMemo(
         () => ({
@@ -893,6 +964,39 @@ const EmailsPage: React.FC = () => {
                 ]}
             />
 
+            <Modal
+                title={`查看密码${passwordTargetEmail ? ` - ${passwordTargetEmail}` : ''}`}
+                open={passwordModalVisible}
+                onCancel={clearPasswordModal}
+                afterClose={() => setRevealedPassword(undefined)}
+                destroyOnClose
+                footer={[
+                    <Button key="close" onClick={clearPasswordModal}>关闭</Button>,
+                ]}
+            >
+                <Spin spinning={passwordLoading}>
+                    {revealedPassword === null ? (
+                        <Text type="secondary">该邮箱未保存密码</Text>
+                    ) : (
+                        <Space.Compact style={{ width: '100%' }}>
+                            <Input.Password
+                                aria-label="邮箱密码"
+                                value={revealedPassword ?? ''}
+                                readOnly
+                                placeholder={passwordLoading ? '正在读取密码…' : ''}
+                            />
+                            <Button
+                                icon={<CopyOutlined />}
+                                onClick={handleCopyPassword}
+                                disabled={!revealedPassword || passwordLoading}
+                            >
+                                复制
+                            </Button>
+                        </Space.Compact>
+                    )}
+                </Spin>
+            </Modal>
+
             {/* 添加/编辑邮箱 Modal */}
             <Modal
                 title={editingId ? '编辑邮箱' : '添加邮箱'}
@@ -908,7 +1012,7 @@ const EmailsPage: React.FC = () => {
                         <Input placeholder="example@outlook.com" />
                     </Form.Item>
                     <Form.Item name="password" label="密码">
-                        <Input.Password placeholder="可选" />
+                        <Input.Password placeholder={editingId ? '留空则保留原密码' : '可选'} />
                     </Form.Item>
 
                     <Form.Item
@@ -923,7 +1027,7 @@ const EmailsPage: React.FC = () => {
                         label="刷新令牌"
                         rules={[{ required: !editingId, message: '请输入刷新令牌' }]}
                     >
-                        <TextArea rows={4} placeholder="OAuth2 Refresh Token" />
+                        <TextArea rows={4} placeholder={editingId ? '留空则保留原刷新令牌' : 'OAuth2 Refresh Token'} />
                     </Form.Item>
                     <Form.Item name="groupId" label="所属分组">
                         <Select placeholder="可选：选择分组" allowClear options={groupOptions} />

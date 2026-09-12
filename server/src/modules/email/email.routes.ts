@@ -18,11 +18,37 @@ const emailRoutes: FastifyPluginAsync = async (fastify) => {
         return { success: true, data: result };
     });
 
+    // 查看保存的密码（仅超级管理员）
+    fastify.get('/:id/password', {
+        preHandler: fastify.requireSuperAdmin,
+    }, async (request, reply) => {
+        reply.header('Cache-Control', 'no-store');
+        reply.header('Pragma', 'no-cache');
+
+        const { id } = request.params as { id: string };
+        const emailId = Number(id);
+        const password = await emailService.getPassword(emailId);
+        request.log.info({
+            systemEvent: true,
+            action: 'email.password_reveal',
+            actorId: request.user?.id ?? null,
+            actorUsername: request.user?.username ?? null,
+            emailId,
+        }, '查看邮箱密码');
+        return { success: true, data: password };
+    });
+
     // 详情
-    fastify.get('/:id', async (request) => {
+    fastify.get('/:id', async (request, reply) => {
         const { id } = request.params as { id: string };
         const { secrets } = request.query as { secrets?: string };
-        const email = await emailService.getById(parseInt(id), secrets === 'true');
+        const includeSecrets = secrets === 'true';
+        if (includeSecrets) {
+            await fastify.requireSuperAdmin(request, reply);
+            reply.header('Cache-Control', 'no-store');
+            reply.header('Pragma', 'no-cache');
+        }
+        const email = await emailService.getById(parseInt(id), includeSecrets);
         return { success: true, data: email };
     });
 

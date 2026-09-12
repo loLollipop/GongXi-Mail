@@ -19,6 +19,35 @@ export function statusUpdateDecision(
 }
 
 type EmailStatusDb = Pick<Prisma.TransactionClient, 'emailAccount'>;
+type EmailPasswordDb = Pick<Prisma.TransactionClient, 'emailAccount'>;
+
+export async function getEmailPasswordWithDb(
+    db: EmailPasswordDb,
+    id: number,
+): Promise<{ password: string | null }> {
+    if (!Number.isSafeInteger(id) || id <= 0) {
+        throw new AppError('INVALID_ID', 'Invalid email account ID', 400);
+    }
+
+    const email = await db.emailAccount.findUnique({
+        where: { id },
+        select: { password: true },
+    });
+
+    if (!email) {
+        throw new AppError('NOT_FOUND', 'Email account not found', 404);
+    }
+
+    if (!email.password) {
+        return { password: null };
+    }
+
+    try {
+        return { password: decrypt(email.password) };
+    } catch {
+        throw new AppError('PASSWORD_UNAVAILABLE', 'Unable to retrieve email password', 500);
+    }
+}
 
 export async function updateEmailStatusWithDb(
     db: EmailStatusDb,
@@ -149,6 +178,14 @@ export const emailService = {
         }
 
         return email;
+    },
+
+    /**
+     * 按需读取单个邮箱账户保存的密码。
+     * 权限控制由管理端路由负责；此处只读取并解密密码字段。
+     */
+    async getPassword(id: number): Promise<{ password: string | null }> {
+        return getEmailPasswordWithDb(prisma, id);
     },
 
     /**
