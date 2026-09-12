@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         GongXi Mail 串行重新授权助手
 // @namespace    https://outlook.wujiaqiao.dpdns.org/
-// @version      1.0.0
+// @version      1.0.1
 // @description  仅为管理员当前设备授权会话填写登录信息；挑战、未知页面或身份不符时暂停。
 // @match        https://outlook.wujiaqiao.dpdns.org/*
 // @match        https://microsoft.com/devicelogin*
 // @match        https://www.microsoft.com/devicelogin*
+// @match        https://microsoft.com/link*
+// @match        https://www.microsoft.com/link*
 // @match        https://login.microsoftonline.com/*
 // @match        https://login.live.com/*
 // @connect      outlook.wujiaqiao.dpdns.org
@@ -28,6 +30,7 @@
     const LEGACY_TICKET = 'gongxi-helper-ticket-v1';
     const TICKET = 'gongxi-helper-ticket-v2:';
     const BINDING = 'gongxi-helper-binding-v2:';
+    const SUBMISSION = 'gongxi-helper-submission-v1';
     const HEARTBEAT = 'gongxi-helper-heartbeat-v1';
     const WORKER = 'gongxi-helper-worker-v1';
     const MS_HOSTS = ['microsoft.com', 'www.microsoft.com', 'login.microsoftonline.com', 'login.live.com'];
@@ -37,9 +40,28 @@
     const secretShape = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
     const uuidShape = (value) => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value);
     const devicePath = (host, path) =>
-        ['microsoft.com', 'www.microsoft.com'].includes(host) && /^\/devicelogin\/?$/i.test(path) ||
+        ['microsoft.com', 'www.microsoft.com'].includes(host) && /^\/(?:devicelogin|link)\/?$/i.test(path) ||
         host === 'login.microsoftonline.com' && /^\/(?:common|consumers)\/oauth2\/deviceauth\/?$/i.test(path) ||
         host === 'login.live.com' && path === '/oauth20_remoteconnect.srf';
+
+    function verificationTarget(session, fragment) {
+        const raw = session?.verificationUri || session?.verificationUriComplete;
+        try {
+            const target = new URL(raw);
+            if (target.protocol !== 'https:' || !MS_HOSTS.includes(target.hostname) ||
+                target.username || target.password || !devicePath(target.hostname, target.pathname)) return null;
+            target.hash = fragment;
+            return target.href;
+        } catch { return null; }
+    }
+
+    function bootstrapTarget(session, bindingId, runId) {
+        const verification = verificationTarget(session, '');
+        if (!verification || !uuidShape(bindingId) || !uuidShape(runId) || !uuidShape(session?.sessionId)) return null;
+        const payload = btoa(JSON.stringify({ bindingId, runId, sessionId: session.sessionId, target: verification }))
+            .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        return `${ORIGIN}/reauthorizations#gongxi-helper-launch=${payload}`;
+    }
 
     function submittedDeviceCode(progress, expectedClientId) {
         const proof = progress?.deviceSubmission;
@@ -47,48 +69,109 @@
             proof.bindingId === progress.bindingId && typeof expectedClientId === 'string' && expectedClientId.length > 0 &&
             proof.clientId === expectedClientId && Number.isFinite(proof.submittedAt);
     }
-    function clientBound(view, expectedClientId) {
+    function submittedAccountEmail(progress, expectedEmail, expectedClientId) {
+        const proof = progress?.emailSubmission;
+        return submittedDeviceCode(progress, expectedClientId) && !!proof && proof.runId === progress.runId &&
+            proof.sessionId === progress.sessionId && proof.bindingId === progress.bindingId &&
+            proof.clientId === expectedClientId && normalize(proof.email) === normalize(expectedEmail) &&
+            Number.isFinite(proof.submittedAt) && proof.submittedAt >= progress.deviceSubmission.submittedAt;
+    }
+    function recoverSubmissionProofs(stored, progress, expectedEmail, expectedClientId, now) {
+        if (!stored || stored.version !== 1 || stored.runId !== progress?.runId ||
+            stored.sessionId !== progress?.sessionId || stored.bindingId !== progress?.bindingId ||
+            stored.clientId !== expectedClientId || normalize(stored.email) !== normalize(expectedEmail) ||
+            !Number.isFinite(progress?.boundAt) || stored.boundAt !== progress.boundAt ||
+            !Number.isFinite(progress?.expiresAt) || stored.expiresAt !== progress.expiresAt ||
+            now < progress.boundAt || now >= progress.expiresAt || progress.actions?.device !== true) return null;
+        const deviceSubmission = stored.deviceSubmission;
+        const candidate = { ...progress, deviceSubmission };
+        if (!submittedDeviceCode(candidate, expectedClientId) || deviceSubmission.submittedAt < progress.boundAt ||
+            deviceSubmission.submittedAt > now || deviceSubmission.submittedAt >= progress.expiresAt) return null;
+        if (stored.emailSubmission === undefined) return { deviceSubmission };
+        candidate.emailSubmission = stored.emailSubmission;
+        if (progress.actions?.email !== true || !submittedAccountEmail(candidate, expectedEmail, expectedClientId) ||
+            stored.emailSubmission.submittedAt > now || stored.emailSubmission.submittedAt >= progress.expiresAt) return null;
+        return { deviceSubmission, emailSubmission: stored.emailSubmission };
+    }
+    function clientCompatible(view, expectedClientId) {
         return typeof expectedClientId === 'string' && expectedClientId.length > 0 &&
-            Array.isArray(view.clientIds) && view.clientIds.length > 0 &&
+            Array.isArray(view.clientIds) &&
             view.clientIds.every((clientId) => clientId === expectedClientId);
     }
     // Pure, intentionally conservative policy. Unknown layouts and post-device steps without
-    // a tab-private submission proof and an explicit matching OAuth client id never submit.
+    // a tab-private submission proof never submit. Microsoft normally carries the OAuth client
+    // in server-side flow state after device-code entry, so client_id is checked when present but
+    // is not required to be repeated in every later page URL or form action.
     function decide(view, expectedEmail, expectedClientId, progress) {
-        if (view.challenge || view.error) return 'pause';
+        if (view.error) return 'pause';
         // A consent/continue affordance can coexist with login inputs during Microsoft
         // layout transitions. It always wins over every automatable branch.
         if (view.consent || view.continue) return 'pause';
-        if (view.identities.some((identity) => normalize(identity) !== normalize(expectedEmail))) return 'mismatch';
-        const matched = view.identities.some((identity) => normalize(identity) === normalize(expectedEmail));
+        // Microsoft's passwordless-first screen is technically a verification challenge, but
+        // selecting its explicit password alternative neither submits a secret nor bypasses MFA.
+        if (view.passwordOption) {
+            if (view.identities.some((identity) => normalize(identity) !== normalize(expectedEmail))) return 'mismatch';
+            return submittedAccountEmail(progress, expectedEmail, expectedClientId) &&
+                clientCompatible(view, expectedClientId) ? 'choose-password' : 'pause';
+        }
+        if (view.challenge) return 'pause';
         if (view.device && view.devicePath) return typeof expectedClientId === 'string' && expectedClientId.length > 0 ? 'device' : 'pause';
         const submitted = submittedDeviceCode(progress, expectedClientId);
-        const bound = clientBound(view, expectedClientId);
-        if (view.email) return submitted && bound ? 'email' : 'pause';
-        if (view.password) return submitted && bound && matched ? 'password' : 'pause';
-        if (view.picker) return submitted && bound ? 'choose-other' : 'pause';
-        if (view.staySignedIn && progress.passwordSent && matched) return submitted && bound ? 'stay-no' : 'pause';
+        const compatible = clientCompatible(view, expectedClientId);
+        // Account tiles intentionally contain identities other than the queued account. Always
+        // choose the explicit "use another account" tile instead of accepting a cached session.
+        if (view.picker) return submitted && compatible ? 'choose-other' : 'pause';
+        if (view.email) return submitted && compatible ? 'email' : 'pause';
+        if (view.identities.some((identity) => normalize(identity) !== normalize(expectedEmail))) return 'mismatch';
+        const matched = view.identities.some((identity) => normalize(identity) === normalize(expectedEmail));
+        // A matching cached-account password page is still not enough: this helper must have
+        // submitted the queued email itself during this bound device flow first.
+        if (view.password) return submittedAccountEmail(progress, expectedEmail, expectedClientId) && compatible && matched ? 'password' : 'pause';
+        if (view.staySignedIn && progress.passwordSent && matched) return submitted && compatible ? 'stay-no' : 'pause';
         if (view.done) return 'wait';
         return 'unknown';
     }
     function mayAct(control, tab, now) {
         return !!control && control.state === 'running' && !control.manual && control.runId === tab.runId &&
             control.sessionId === tab.sessionId && control.bindingId === tab.bindingId &&
-            now - control.heartbeat < 20000 && now < tab.expiresAt;
+            recentTimestamp(control.heartbeat, now, 20000) && now < tab.expiresAt;
     }
     function nextDelay(session, now) {
         return Math.max(1000, Date.parse(session.nextPollAt) - Date.parse(session.serverTime || new Date(now).toISOString()));
     }
+    function recentTimestamp(value, now, maxAge) {
+        return Number.isFinite(value) && value <= now && now - value < maxAge;
+    }
     function workerRequiresPause(control, worker, now) {
-        if (!control?.sessionId || control.manual || !control.handoffAt) return false;
+        if (!control?.sessionId || control.manual) return false;
+        if (!Number.isFinite(control.handoffAt) || control.handoffAt > now) return true;
         return worker?.runId === control.runId && worker.sessionId === control.sessionId && worker.bindingId === control.bindingId
-            ? !!worker.paused || now - worker.heartbeat >= 20000
-            : now - control.handoffAt >= 20000;
+            ? !!worker.paused || !recentTimestamp(worker.heartbeat, now, 20000)
+            : !recentTimestamp(control.handoffAt, now, 20000);
+    }
+    function workerConfirmedFreshLogin(control, worker, now) {
+        return !!control?.sessionId && worker?.runId === control.runId && worker.sessionId === control.sessionId &&
+            worker.bindingId === control.bindingId && worker.freshLogin === true && !worker.paused &&
+            Number.isFinite(control.handoffAt) && control.handoffAt <= now &&
+            Number.isFinite(worker.freshLoginAt) && worker.freshLoginAt >= control.handoffAt && worker.freshLoginAt <= now;
+    }
+    function manualSuccessConfirmed(control, session, now) {
+        const proof = control?.manualSuccess;
+        return session?.status === 'SUCCEEDED' && proof?.runId === control.runId && proof.sessionId === control.sessionId &&
+            proof.sessionId === session.sessionId && proof.bindingId === control.bindingId &&
+            Number.isFinite(control.handoffAt) && control.handoffAt <= now &&
+            Number.isFinite(proof.confirmedAt) && proof.confirmedAt >= control.handoffAt && proof.confirmedAt <= now;
+    }
+    function mergeSessionSnapshot(previous, incoming) {
+        if (!previous || previous.sessionId !== incoming?.sessionId) return previous;
+        return previous.status === 'SUCCEEDED' && incoming.status !== 'SUCCEEDED' ? previous : incoming;
     }
 
     // The test harness evaluates these pure functions in an isolated Node VM.
     if (typeof document === 'undefined') {
-        if (typeof module !== 'undefined') module.exports = { decide, mayAct, devicePath, nextDelay, secretShape, submittedDeviceCode, workerRequiresPause };
+        if (typeof module !== 'undefined') module.exports = { decide, mayAct, devicePath, nextDelay, secretShape,
+            submittedDeviceCode, submittedAccountEmail, recoverSubmissionProofs, verificationTarget, bootstrapTarget,
+            workerRequiresPause, workerConfirmedFreshLogin, manualSuccessConfirmed };
         return;
     }
     if (window.top !== window.self || location.protocol !== 'https:') return;
@@ -134,6 +217,8 @@
         let bindingId = null;
         let beat = null;
         let cooldownUntil = 0;
+        let generation = 0;
+        let continuePending = false;
         ui.set('先用 1–2 个授权账号试运行。未知页面自动暂停。');
         async function request(path, body) {
             // This function exists only on the backend origin. Never GM-store JWT.
@@ -154,26 +239,50 @@
             const value = control();
             if (value?.runId === runId) GM_setValue(CONTROL, { ...value, ...fields });
         }
+        function captureCurrentContext() {
+            const state = control();
+            const sessionId = current?.sessionId ?? null;
+            const activeBindingId = bindingId ?? null;
+            if (!runId || !state || state.runId !== runId || state.sessionId !== sessionId ||
+                (state.bindingId ?? null) !== activeBindingId || state.generation !== generation) return null;
+            return { runId, sessionId, bindingId: activeBindingId, generation };
+        }
+        function contextIsCurrent(snapshot) {
+            if (!snapshot || runId !== snapshot.runId || generation !== snapshot.generation ||
+                (current?.sessionId ?? null) !== snapshot.sessionId || (bindingId ?? null) !== snapshot.bindingId) return false;
+            const state = control();
+            return state?.runId === snapshot.runId && state.sessionId === snapshot.sessionId &&
+                (state.bindingId ?? null) === snapshot.bindingId && state.generation === snapshot.generation;
+        }
+        function applySessionSnapshot(snapshot, incoming) {
+            if (!contextIsCurrent(snapshot) || incoming?.sessionId !== snapshot.sessionId) return false;
+            current = mergeSessionSnapshot(current, incoming);
+            return true;
+        }
         function clearHandoff(id = bindingId) {
             if (!id) return;
             GM_deleteValue(`${BINDING}${id}`);
             GM_deleteValue(`${TICKET}${id}`);
         }
-        function pause() {
+        function pause(reason = '管理员暂停；当前 Microsoft 页面请人工完成') {
             clearHandoff();
-            update({ state: 'paused', manual: !!current, reason: '管理员暂停；当前 Microsoft 页面请人工完成' });
+            generation += 1;
+            update({ state: 'paused', generation, manual: !!current, reason });
         }
         function checkWorker() {
             const state = control();
+            const now = Date.now();
+            if (manualSuccessConfirmed(state, current, now)) return;
             const worker = GM_getValue(WORKER, null);
-            if (workerRequiresPause(state, worker, Date.now())) {
-                update({ state: 'paused', manual: true, reason: worker?.paused ? worker.reason : 'Microsoft 助手失联或进入未授权域名，已转人工' });
+            if (workerRequiresPause(state, worker, now)) {
+                pause(worker?.paused ? worker.reason : 'Microsoft 助手失联或进入未授权域名，已转人工');
             }
         }
         async function finish() {
             if (!runId || control()?.runId !== runId) { ui.set('此后台标签页没有运行助手。'); return; }
             quitting = true;
-            update({ state: 'stopped' });
+            generation += 1;
+            update({ state: 'stopped', generation });
             clearHandoff();
             GM_deleteValue(LEGACY_TICKET);
             document.documentElement.removeAttribute('data-gongxi-helper-busy');
@@ -184,7 +293,39 @@
                 ui.set('请在后台「批量重新授权」页面启动。'); return;
             }
             if (running) {
-                update({ state: 'running', reason: '' });
+                if (continuePending) return;
+                continuePending = true;
+                try {
+                    const state = control();
+                    if (current && state?.manual) {
+                        try {
+                            const readContext = captureCurrentContext();
+                            if (!readContext) return;
+                            let observed = await request(`/admin/email-reauthorizations/${readContext.sessionId}`);
+                            if (!applySessionSnapshot(readContext, observed)) return;
+                            if (current.status === 'PENDING' && Date.parse(current.nextPollAt) <= Date.parse(current.serverTime)) {
+                                const pollContext = captureCurrentContext();
+                                if (!pollContext) return;
+                                observed = await request(`/admin/email-reauthorizations/${pollContext.sessionId}/poll`, {});
+                                if (!applySessionSnapshot(pollContext, observed)) return;
+                            }
+                        } catch {
+                            ui.set('无法核验当前会话，请稍后重试。'); return;
+                        }
+                        if (current.status !== 'SUCCEEDED') {
+                            ui.set('当前项尚未通过后台核验，请先在 Microsoft 页面完成人工验证。'); return;
+                        }
+                        const confirmedControl = control();
+                        const now = Date.now();
+                        if (!confirmedControl || confirmedControl.runId !== runId ||
+                            confirmedControl.sessionId !== current.sessionId || confirmedControl.bindingId !== bindingId ||
+                            confirmedControl.generation !== generation) return;
+                        update({ state: 'running', manual: false, reason: '', manualSuccess: { runId,
+                            sessionId: current.sessionId, bindingId: confirmedControl.bindingId, confirmedAt: now } });
+                    } else update({ state: 'running', manual: false, reason: '' });
+                } finally {
+                    continuePending = false;
+                }
                 return;
             }
             if (!navigator.locks) { ui.set('浏览器不支持单队列互斥锁，请使用最新版 Chrome / Edge。'); return; }
@@ -195,7 +336,9 @@
                     if (!lock) { ui.set('另一个后台标签页正在运行助手。'); return; }
                     runId = crypto.randomUUID();
                     GM_deleteValue(LEGACY_TICKET);
-                    GM_setValue(CONTROL, { runId, state: 'running', sessionId: null, bindingId: null, manual: false, heartbeat: Date.now() });
+                    generation = 0;
+                    GM_setValue(CONTROL, { runId, state: 'running', sessionId: null, bindingId: null,
+                        generation, manual: false, heartbeat: Date.now() });
                     GM_setValue(HEARTBEAT, { runId, heartbeat: Date.now() });
                     document.documentElement.setAttribute('data-gongxi-helper-busy', 'true');
                     beat = setInterval(() => {
@@ -212,24 +355,41 @@
                                 ui.set(`当前项已成功，${Math.ceil((cooldownUntil - Date.now()) / 1000)} 秒后开始下一项。`);
                                 await sleep(1000); continue;
                             }
+                            const candidateContext = captureCurrentContext();
+                            if (!candidateContext) continue;
                             const candidates = await request('/admin/email-reauthorizations/candidates');
-                            if (quitting || control()?.state !== 'running') continue;
+                            if (quitting || !contextIsCurrent(candidateContext) || control()?.state !== 'running') continue;
                             const candidate = candidates.find((value) => value.supported);
                             if (!candidate) { ui.set('队列已完成，没有待重新授权的受支持邮箱。'); break; }
-                            current = candidate.activeSession || await request('/admin/email-reauthorizations/start', { emailId: candidate.emailId });
-                            update({ sessionId: current.sessionId, bindingId: null, manual: false, handoffAt: null });
+                            let selected = candidate.activeSession;
+                            if (!selected) {
+                                const startContext = captureCurrentContext();
+                                if (!startContext) continue;
+                                selected = await request('/admin/email-reauthorizations/start', { emailId: candidate.emailId });
+                                if (quitting || !contextIsCurrent(startContext) || control()?.state !== 'running') continue;
+                            }
+                            generation += 1;
+                            current = selected;
+                            bindingId = null;
+                            update({ sessionId: current.sessionId, bindingId: null, generation,
+                                manual: false, handoffAt: null, manualSuccess: null });
                             if (quitting || control()?.state !== 'running') { update({ manual: true }); continue; }
                             if (!['PENDING', 'POLLING'].includes(current.status)) {
-                                update({ state: 'paused', manual: true, reason: '会话未就绪，请人工检查' }); continue;
+                                pause('会话未就绪，请人工检查'); continue;
                             }
                             // Bind the exact child tab before a ticket exists in shared GM storage.
                             clearHandoff();
                             bindingId = crypto.randomUUID();
                             const openedAt = Date.now();
-                            update({ bindingId, handoffAt: openedAt });
+                            generation += 1;
+                            update({ bindingId, generation, handoffAt: openedAt });
                             if (tab) { tab.close(); tab = null; }
-                            tab = GM_openInTab(`https://microsoft.com/devicelogin#gongxi-helper=${bindingId}.${runId}.${current.sessionId}`,
-                                { active: true, insert: true, setParent: true });
+                            const bootstrap = bootstrapTarget(current, bindingId, runId);
+                            if (!bootstrap) {
+                                pause('Microsoft 未返回受支持的设备授权地址，已转人工');
+                                continue;
+                            }
+                            tab = GM_openInTab(bootstrap, { active: true, insert: true, setParent: true });
                             let bound = null;
                             const bindDeadline = openedAt + 15000;
                             while (!quitting && Date.now() < bindDeadline && control()?.state === 'running' && !tab?.closed) {
@@ -242,12 +402,14 @@
                             }
                             if (!bound) {
                                 clearHandoff();
-                                update({ state: 'paused', manual: true, reason: '无法安全绑定新 Microsoft 标签页，已转人工' });
+                                pause('无法安全绑定新 Microsoft 标签页，已转人工');
                                 continue;
                             }
                             // Exactly one handoff per session. A lost/expired ticket requires manual recovery.
-                            const issued = await request(`/admin/email-reauthorizations/${current.sessionId}/helper-ticket`, {});
-                            if (quitting || control()?.state !== 'running' || control()?.bindingId !== bindingId) {
+                            const ticketContext = captureCurrentContext();
+                            if (!ticketContext) { update({ manual: true }); continue; }
+                            const issued = await request(`/admin/email-reauthorizations/${ticketContext.sessionId}/helper-ticket`, {});
+                            if (quitting || !contextIsCurrent(ticketContext) || control()?.state !== 'running') {
                                 issued.ticket = ''; clearHandoff(); update({ manual: true }); continue;
                             }
                             GM_setValue(`${TICKET}${bindingId}`, { ticket: issued.ticket, runId, sessionId: current.sessionId,
@@ -257,41 +419,64 @@
                         }
                         const latest = control();
                         ui.set(`${current.email}\n${latest?.state === 'paused' || latest?.manual ? (latest.reason || '当前项已转人工；成功后可继续下一项') : '正在等待 Microsoft 授权并核验身份…'}`);
-                        if (tab?.closed && latest?.state === 'running') {
-                            update({ state: 'paused', manual: true, reason: 'Microsoft 标签页已关闭，请人工检查当前项' });
+                        if (tab?.closed && latest?.state === 'running' &&
+                            !manualSuccessConfirmed(latest, current, Date.now())) {
+                            pause('Microsoft 标签页已关闭，请人工检查当前项');
                         }
                         await sleep(Math.min(5000, nextDelay(current, Date.now())));
                         if (quitting) break;
                         // Only the backend JWT holder polls or advances the queue.
-                        current = await request(`/admin/email-reauthorizations/${current.sessionId}`);
+                        const readContext = captureCurrentContext();
+                        if (!readContext) continue;
+                        let observed = await request(`/admin/email-reauthorizations/${readContext.sessionId}`);
+                        if (!applySessionSnapshot(readContext, observed)) continue;
                         if (current.status === 'PENDING' && Date.parse(current.nextPollAt) <= Date.parse(current.serverTime)) {
-                            current = await request(`/admin/email-reauthorizations/${current.sessionId}/poll`, {});
+                            const pollContext = captureCurrentContext();
+                            if (!pollContext) continue;
+                            observed = await request(`/admin/email-reauthorizations/${pollContext.sessionId}/poll`, {});
+                            if (!applySessionSnapshot(pollContext, observed)) continue;
                         }
                         checkWorker();
                         if (current.status === 'SUCCEEDED') {
+                            const succeededControl = control();
+                            const succeededWorker = GM_getValue(WORKER, null);
+                            const succeededAt = Date.now();
+                            if (!succeededControl || current.sessionId !== succeededControl.sessionId ||
+                                succeededControl.runId !== runId || succeededControl.bindingId !== bindingId ||
+                                succeededControl.generation !== generation) continue;
+                            if (!workerConfirmedFreshLogin(succeededControl, succeededWorker, succeededAt) &&
+                                !manualSuccessConfirmed(succeededControl, current, succeededAt)) {
+                                pause('未确认当前账号经过使用其他账号/全新邮箱及密码提交，已停止队列');
+                                continue;
+                            }
                             cooldownUntil = Date.now() + 10000;
                             clearHandoff();
-                            update({ sessionId: null, bindingId: null, manual: false });
+                            generation += 1;
                             bindingId = null;
                             if (tab) { tab.close(); tab = null; }
                             current = null;
+                            update({ sessionId: null, bindingId: null, generation,
+                                manual: false, handoffAt: null, manualSuccess: null });
                         } else if (!ACTIVE.includes(current.status)) {
-                            update({ state: 'paused', manual: true, reason: '会话失败、取消、过期或身份不匹配。请结束助手，在后台检查 / 重试。' });
+                            pause('会话失败、取消、过期或身份不匹配。请结束助手，在后台检查 / 重试。');
                         }
                     }
                 });
             } catch {
-                update({ state: 'stopped', manual: true });
+                generation += 1;
+                update({ state: 'stopped', generation, manual: true });
                 ui.set('助手已停止：后台请求或安全凭据失败。请结束助手并刷新队列人工检查；同一会话不会重复领密码。');
             } finally {
                 if (beat) clearInterval(beat);
                 if (runId && control()?.runId === runId) {
-                    update({ state: 'stopped' });
+                    generation += 1;
+                    update({ state: 'stopped', generation });
                     clearHandoff();
                     GM_deleteValue(LEGACY_TICKET);
                     document.documentElement.removeAttribute('data-gongxi-helper-busy');
                 }
                 running = false;
+                generation += 1;
                 current = null;
                 bindingId = null;
                 runId = null;
@@ -300,7 +485,10 @@
         ui.button('暂停（当前项转人工）', async () => pause());
         ui.button('结束助手 / 切换人工', finish);
         window.addEventListener('pagehide', () => {
-            if (runId && control()?.runId === runId) { update({ state: 'stopped' }); clearHandoff(); GM_deleteValue(LEGACY_TICKET); }
+            if (runId && control()?.runId === runId) {
+                generation += 1;
+                update({ state: 'stopped', generation }); clearHandoff(); GM_deleteValue(LEGACY_TICKET);
+            }
         });
     }
 
@@ -354,26 +542,25 @@
     }
     function visibleClientIds(element) {
         const submission = effectiveSubmission(element);
-        if (!submission || !safeMicrosoftUrl(submission.action)) return [];
         const result = [];
-        for (const raw of [location.href, submission.action.href]) {
-            const values = urlClientIds(raw);
-            if (!values.length) return [];
-            result.push(...values);
-        }
+        result.push(...urlClientIds(location.href));
+        if (submission && safeMicrosoftUrl(submission.action)) result.push(...urlClientIds(submission.action.href));
         return result;
     }
     function snapshot() {
         const text = document.body.innerText || '';
-        const identities = [...document.querySelectorAll('#displayName, #idDiv_PWD_Username, #loginHeader .identity, [data-test-id="user-display-name"], #idDiv_UserTile .table-cell.text-left')]
+        const identities = [...document.querySelectorAll('#displayName, #bannerText, #idDiv_PWD_Username, #loginHeader .identity, [data-test-id="user-display-name"], #idDiv_UserTile .table-cell.text-left')]
             .filter(visible).flatMap((node) => words(node).match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []);
-        const email = one('#i0116[name="loginfmt"]');
-        const password = one('input#i0118[name="passwd"][type="password"]');
+        const email = one('#i0116[name="loginfmt"], #usernameEntry[type="email"][autocomplete~="username"]');
+        const password = one('input#i0118[name="passwd"][type="password"], #passwordEntry[type="password"], input[type="password"][autocomplete="current-password"]');
         const device = one('#otc, input[name="user_code"]');
-        const submitButtons = allVisible('#idSIButton9, #idSubmit_Consent, #idBtn_Accept');
+        const submitButtons = allVisible('#idSIButton9, #idSubmit_Consent, #idBtn_Accept, form button[type="submit"]');
         const submit = submitButtons[0] || null;
         const picker = one('#otherTile, #idDiv_UseAnotherAccount');
-        const no = one('#idBtn_Back');
+        const passwordOption = allVisible('button, a, [role="button"]').find((node) =>
+            /^(?:Use (?:your )?password|Sign in with (?:your )?password|使用密码|用密码登录|使用密码登录)$/i.test(words(node))) || null;
+        const no = one('#idBtn_Back') || allVisible('button, input[type="button"], input[type="submit"]').find((node) =>
+            /^(?:No|否)$/i.test(words(node))) || null;
         const isDevicePage = devicePath(location.hostname, location.pathname) && !!device;
         const challenge = !!one('#idDiv_SAOTCS_Proofs, #idTxtBx_SAOTCC_OTC, #iOttText, iframe[src*="captcha"], input[name="ProofConfirmation"]') ||
             !isDevicePage && (!!one('input[name="otc"][autocomplete="one-time-code"]') || /验证码/i.test(text)) ||
@@ -385,7 +572,7 @@
         const staySignedIn = /stay signed in|保持登录|保持登入/i.test(text) && visible(no);
         const clientTarget = email || password ? submit : picker || (staySignedIn ? no : null);
         return {
-            identities, email, password, device, submit, picker, no, challenge, error,
+            identities, email, password, device, submit, picker, passwordOption, no, challenge, error,
             devicePath: devicePath(location.hostname, location.pathname),
             staySignedIn, clientIds: visibleClientIds(clientTarget),
             consent: buttonTexts.some((value) => /^(?:Accept|Allow|Yes|接受|允许|是)$/i.test(value)) &&
@@ -395,16 +582,34 @@
             done: /you have signed in|you('re| are) now signed in|you may (?:now )?close|you can (?:now )?close|已成功登录|现在可以关闭|您已登录|你已登录/i.test(text),
         };
     }
-    function safeTarget(element, expectedClientId, requireClient, requirePost) {
+    function compatibleClientIds(rawUrls, expectedClientId) {
+        return typeof expectedClientId === 'string' && expectedClientId.length > 0 && rawUrls
+            .flatMap((raw) => urlClientIds(raw)).every((value) => value === expectedClientId);
+    }
+    function safeTarget(element, expectedClientId, requirePost) {
         const submission = effectiveSubmission(element);
         if (!submission || !safeMicrosoftUrl(submission.action) || !safeMicrosoftUrl(new URL(location.href))) return false;
         if (requirePost && submission.method !== 'post') return false;
-        if (!requireClient) return true;
-        if (typeof expectedClientId !== 'string' || !expectedClientId) return false;
-        return [location.href, submission.action.href].every((raw) => {
-            const values = urlClientIds(raw);
-            return values.length > 0 && values.every((value) => value === expectedClientId);
-        });
+        return compatibleClientIds([location.href, submission.action.href], expectedClientId);
+    }
+    function safeEntryTarget(element, expectedClientId) {
+        if (!visible(element) || !safeMicrosoftUrl(new URL(location.href))) return null;
+        const rawHref = element.getAttribute?.('href');
+        if (rawHref !== null && rawHref !== undefined && String(rawHref).trim()) {
+            try {
+                const target = new URL(element.href || rawHref, location.href);
+                return safeMicrosoftUrl(target) && compatibleClientIds([location.href, target.href], expectedClientId)
+                    ? { action: target, method: 'get' } : null;
+            } catch { return null; }
+        }
+        const form = elementForm(element);
+        if (form) {
+            const submission = effectiveSubmission(element);
+            return submission && safeMicrosoftUrl(submission.action) &&
+                compatibleClientIds([location.href, submission.action.href], expectedClientId) ? submission : null;
+        }
+        const target = new URL(location.href);
+        return compatibleClientIds([target.href], expectedClientId) ? { action: target, method: '' } : null;
     }
     function fill(input, value) {
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
@@ -413,17 +618,27 @@
         input.dispatchEvent(new Event('change', { bubbles: true }));
     }
     function actionElements(view, action) {
-        const target = action === 'stay-no' ? view.no : action === 'choose-other' ? view.picker : view.submit;
+        const target = action === 'stay-no' ? view.no : action === 'choose-other' ? view.picker :
+            action === 'choose-password' ? view.passwordOption : view.submit;
         const input = action === 'device' ? view.device : action === 'email' ? view.email : action === 'password' ? view.password : null;
         return { target, input, form: elementForm(target), inputForm: elementForm(input) };
     }
     function captureAction(action, view, current) {
         const elements = actionElements(view, action);
+        if (action === 'choose-other' || action === 'choose-password') {
+            const expectedText = action === 'choose-other'
+                ? /^(?:Use another account|Use a different account|使用其他(?:帐户|账户|账号)|使用另一个(?:帐户|账户|账号))$/i
+                : /^(?:Use (?:your )?password|Sign in with (?:your )?password|使用密码|用密码登录|使用密码登录)$/i;
+            const entry = safeEntryTarget(elements.target, current.clientId);
+            if (!entry || !expectedText.test(words(elements.target))) return null;
+            return { action, href: location.href, target: elements.target, input: null, form: null,
+                submissionAction: entry.action.href, submissionMethod: entry.method };
+        }
         const submission = effectiveSubmission(elements.target);
-        const requiresClient = action !== 'device';
-        if (!submission || !safeTarget(elements.target, current.clientId, requiresClient, action === 'password')) return null;
+        if (!submission || !safeTarget(elements.target, current.clientId, ['email', 'password'].includes(action))) return null;
         if (!visible(elements.target) || elements.input && elements.inputForm !== elements.form) return null;
-        if (['device', 'email', 'password'].includes(action) &&
+        if (['device', 'email', 'password'].includes(action) && elements.target.id !== 'idSIButton9' &&
+            !elements.target.matches?.('button[type="submit"]') &&
             !/^(?:Next|Sign in|Continue|下一步|登录|登入|继续)$/i.test(words(elements.target))) return null;
         return { action, href: location.href, target: elements.target, input: elements.input, form: elements.form,
             submissionAction: submission.action.href, submissionMethod: submission.method };
@@ -442,8 +657,9 @@
         if (!view.device || !view.devicePath || view.consent || view.continue) return null;
         const elements = actionElements(view, 'device');
         const submission = effectiveSubmission(elements.target);
-        if (!submission || !safeTarget(elements.target, '', false, false) || elements.inputForm !== elements.form ||
-            !/^(?:Next|Continue|下一步|继续)$/i.test(words(elements.target))) return null;
+        if (!submission || !safeMicrosoftUrl(submission.action) || !safeMicrosoftUrl(new URL(location.href)) ||
+            elements.inputForm !== elements.form ||
+            elements.target.id !== 'idSIButton9' && !/^(?:Next|Continue|下一步|继续)$/i.test(words(elements.target))) return null;
         return { href: location.href, target: elements.target, input: elements.input, form: elements.form,
             submissionAction: submission.action.href, submissionMethod: submission.method };
     }
@@ -460,10 +676,41 @@
             ? { bindingId: parts[0], runId: parts[1], sessionId: parts[2] }
             : null;
     }
+    function readBootstrap(hash) {
+        try {
+            const prefix = '#gongxi-helper-launch=';
+            if (!hash.startsWith(prefix)) return null;
+            const raw = hash.slice(prefix.length);
+            if (!raw || !/^[A-Za-z0-9_-]+$/.test(raw)) return null;
+            const decoded = raw.replace(/-/g, '+').replace(/_/g, '/');
+            const payload = JSON.parse(atob(decoded + '='.repeat((4 - decoded.length % 4) % 4)));
+            const binding = [payload?.bindingId, payload?.runId, payload?.sessionId].every(uuidShape)
+                ? { bindingId: payload.bindingId, runId: payload.runId, sessionId: payload.sessionId } : null;
+            const target = verificationTarget({ verificationUri: payload?.target }, '');
+            return binding && target ? { ...binding, target } : null;
+        } catch { return null; }
+    }
+    function savedLaunch(value) {
+        const target = verificationTarget({ verificationUri: value?.target }, '');
+        return value && target && uuidShape(value.bindingId) && uuidShape(value.runId) && uuidShape(value.sessionId) &&
+            Number.isFinite(value.expiresAt) && value.expiresAt > Date.now() ? { ...value, target } : null;
+    }
+    async function bootstrapMain(launch) {
+        const target = verificationTarget({ verificationUri: launch?.target }, '');
+        if (!target) return;
+        const now = Date.now();
+        const candidate = { ...launch, target, expiresAt: now + 30000 };
+        if (!mayAct(readControl(), candidate, now)) return;
+        const tabState = await new Promise((resolve) => GM_getTab(resolve));
+        tabState.gongxiHelperLaunch = candidate;
+        await new Promise((resolve) => GM_saveTab(tabState, resolve));
+        if (!mayAct(readControl(), candidate, Date.now())) return;
+        location.replace(target);
+    }
     async function microsoftMain() {
         const tabState = await new Promise((resolve) => GM_getTab(resolve));
         let task = tabState.gongxiHelper;
-        const launch = readLaunchBinding(location.hash);
+        const launch = readLaunchBinding(location.hash) || savedLaunch(tabState.gongxiHelperLaunch);
         if (task && (!uuidShape(task.runId) || !uuidShape(task.sessionId) || !uuidShape(task.bindingId))) return;
         const save = () => new Promise((resolve) => {
             tabState.gongxiHelper = task;
@@ -471,12 +718,42 @@
         });
         const ui = panel('GongXi Mail 当前授权');
         let pendingPasswordInput = null;
-        function pause(message) {
+        function clearPendingPassword() {
             try {
                 if (pendingPasswordInput) fill(pendingPasswordInput, '');
             } catch { /* The page may already have replaced the detached input. */ }
             pendingPasswordInput = null;
+        }
+        function clearSubmissionProof() {
+            const stored = GM_getValue(SUBMISSION, null);
+            if (stored?.runId === task.runId && stored.sessionId === task.sessionId && stored.bindingId === task.bindingId) {
+                GM_deleteValue(SUBMISSION);
+            }
+        }
+        function restoreSubmissionProofs(current) {
+            const restored = recoverSubmissionProofs(GM_getValue(SUBMISSION, null), task,
+                current.email, current.clientId, Date.now());
+            if (!restored) return;
+            task.deviceSubmission = restored.deviceSubmission;
+            if (restored.emailSubmission) task.emailSubmission = restored.emailSubmission;
+        }
+        function persistSubmissionProofs(current) {
+            const stored = {
+                version: 1, runId: task.runId, sessionId: task.sessionId, bindingId: task.bindingId,
+                clientId: current.clientId, email: current.email, boundAt: task.boundAt, expiresAt: task.expiresAt,
+                deviceSubmission: task.deviceSubmission,
+                ...(task.emailSubmission ? { emailSubmission: task.emailSubmission } : {}),
+            };
+            if (!recoverSubmissionProofs(stored, task, current.email, current.clientId, Date.now())) return false;
+            // Legacy GM_setValue is synchronous. This non-secret receipt is durable before the
+            // form's default navigation can terminate this document and its GM_saveTab callback.
+            GM_setValue(SUBMISSION, stored);
+            return true;
+        }
+        function pause(message) {
+            clearPendingPassword();
             GM_deleteValue(`${TICKET}${task.bindingId}`);
+            clearSubmissionProof();
             const state = readControl();
             if (state?.runId === task.runId && state.sessionId === task.sessionId && state.bindingId === task.bindingId) {
                 GM_setValue(WORKER, { runId: task.runId, sessionId: task.sessionId, bindingId: task.bindingId,
@@ -488,12 +765,21 @@
             ui.set(message + '\n请人工处理；后台核验成功前不会进入下一项。');
         }
         let claimPage = captureBoundDevicePage();
+        if (!task && launch && !claimPage) {
+            const readyDeadline = Math.min(launch.expiresAt ?? Date.now() + 15000, Date.now() + 15000);
+            while (!claimPage && Date.now() < readyDeadline && mayAct(readControl(), launch, Date.now()) &&
+                safeMicrosoftUrl(new URL(location.href))) {
+                await sleep(200);
+                claimPage = captureBoundDevicePage();
+            }
+        }
         if (!task) {
             if (!launch || !claimPage) return;
             const boundAt = Date.now();
             const candidate = { ...launch, boundAt, expiresAt: boundAt + 30000 };
             if (!mayAct(readControl(), candidate, boundAt)) return;
             task = { ...candidate, actions: {} };
+            delete tabState.gongxiHelperLaunch;
             await save();
             if (!sameBoundDevicePage(claimPage, task)) { pause('设备授权页在绑定期间发生变化，已暂停'); return; }
             GM_setValue(`${BINDING}${task.bindingId}`, { ...launch, boundAt });
@@ -513,7 +799,7 @@
                 while (mayAct(readControl(), task, Date.now()) && Date.now() < deadline) {
                     if (!sameBoundDevicePage(claimPage, task)) { pause('当前标签页已离开绑定的设备授权页，未领取安全凭据'); return; }
                     GM_setValue(WORKER, { runId: task.runId, sessionId: task.sessionId, bindingId: task.bindingId,
-                        heartbeat: Date.now(), paused: false });
+                        heartbeat: Date.now(), paused: false, freshLogin: false });
                     const value = GM_getValue(ticketKey, null);
                     if (value?.runId === task.runId && value.sessionId === task.sessionId && value.bindingId === task.bindingId &&
                         value.boundAt === task.boundAt && value.publishedAt >= task.boundAt && secretShape(value.ticket) && value.expiresAt > Date.now()) {
@@ -542,16 +828,30 @@
             let lastAction = null;
             let lastAt = 0;
             while (mayAct(readControl(), task, Date.now()) && !task.stopped) {
+                const now = Date.now();
+                const state = readControl();
+                const storedWorker = GM_getValue(WORKER, null);
+                const submittedWorker = task.passwordSubmission
+                    ? { ...task.passwordSubmission, paused: false, freshLogin: true,
+                        freshLoginAt: task.passwordSubmission.submittedAt }
+                    : null;
+                const confirmedWorker = workerConfirmedFreshLogin(state, submittedWorker, now) ? submittedWorker :
+                    workerConfirmedFreshLogin(state, storedWorker, now) ? storedWorker : null;
                 GM_setValue(WORKER, { runId: task.runId, sessionId: task.sessionId, bindingId: task.bindingId,
-                    heartbeat: Date.now(), paused: false });
+                    heartbeat: now, paused: false, freshLogin: !!confirmedWorker,
+                    ...(confirmedWorker ? { freshLoginAt: confirmedWorker.freshLoginAt } : {}) });
                 let current = await helperRequest('current', task.capability);
                 if (current.sessionId !== task.sessionId) throw new Error('binding');
                 if (current.status === 'SUCCEEDED') {
+                    clearPendingPassword();
+                    clearSubmissionProof();
                     task.capability = ''; task.stopped = true; await save();
                     ui.set('后台已核验成功，等待队列安排下一项。'); return;
                 }
+                restoreSubmissionProofs(current);
                 if (!mayAct(readControl(), task, Date.now()) || task.stopped) break;
                 const view = snapshot();
+                if (pendingPasswordInput && view.password !== pendingPasswordInput) clearPendingPassword();
                 const action = decide(view, current.email, current.clientId, task);
                 ui.set(`${current.email}\n只处理当前会话，安全挑战请人工完成。`);
                 if (action === 'pause' || action === 'mismatch') {
@@ -579,7 +879,6 @@
                 await save();
                 marker = recaptureAction(marker, current, task);
                 if (!marker) { pause('Microsoft 页面在操作前发生变化，已暂停'); return; }
-                let deviceSubmitObserved = false;
                 if (action === 'password') {
                     let credential = await helperRequest('password', task.capability);
                     try {
@@ -597,28 +896,44 @@
                         fill(marker.input, '');
                         pause('密码填写后 Microsoft 页面或会话绑定发生变化，已清空密码并暂停'); return;
                     }
-                    // No asynchronous boundary is permitted between this final validation and submission.
-                    finalMarker.target.click();
-                    pendingPasswordInput = null;
+                    task.passwordSubmission = { runId: task.runId, sessionId: task.sessionId, bindingId: task.bindingId,
+                        clientId: current.clientId, email: current.email, submittedAt: Date.now() };
+                    GM_setValue(WORKER, { runId: task.runId, sessionId: task.sessionId, bindingId: task.bindingId,
+                        heartbeat: Date.now(), paused: false, freshLogin: true,
+                        freshLoginAt: task.passwordSubmission.submittedAt });
+                    // The verified Microsoft button click is the last synchronous operation. Modern
+                    // Microsoft pages can navigate from a click handler without dispatching a native
+                    // form submit event, so waiting for submit would lose the proof during navigation.
+                    try { finalMarker.target.click(); }
+                    catch (error) {
+                        task.passwordSubmission = null;
+                        GM_setValue(WORKER, { runId: task.runId, sessionId: task.sessionId, bindingId: task.bindingId,
+                            heartbeat: Date.now(), paused: true, freshLogin: false, reason: '密码登录按钮未能执行，已暂停' });
+                        throw error;
+                    }
+                    void save();
                 } else {
                     if (action === 'device') fill(marker.input, current.userCode);
                     if (action === 'email') fill(marker.input, current.email);
                     const finalMarker = recaptureAction(marker, current, task);
                     if (!finalMarker) { pause('Microsoft 页面在提交前发生变化，已暂停'); return; }
-                    if (action === 'device') {
-                        finalMarker.form.addEventListener('submit', () => {
-                            deviceSubmitObserved = true;
-                            task.deviceSubmission = { runId: task.runId, sessionId: task.sessionId, bindingId: task.bindingId,
-                                clientId: current.clientId, submittedAt: Date.now() };
-                            void save();
-                        }, { once: true });
+                    if (action === 'device' || action === 'email') {
+                        const proof = { runId: task.runId, sessionId: task.sessionId, bindingId: task.bindingId,
+                            clientId: current.clientId, submittedAt: Date.now() };
+                        if (action === 'device') task.deviceSubmission = proof;
+                        else task.emailSubmission = { ...proof, email: current.email };
+                        if (!persistSubmissionProofs(current)) {
+                            pause(`无法可靠保存本次${action === 'device' ? '设备码' : '邮箱'}操作证明，已暂停`); return;
+                        }
                     }
-                    // No asynchronous boundary is permitted between this final validation and submission.
-                    finalMarker.target.click();
-                }
-                if (action === 'device') {
-                    if (!deviceSubmitObserved) { pause('无法确认本次设备码已提交，已暂停'); return; }
-                    await save();
+                    // No asynchronous boundary is permitted between proof persistence, final
+                    // validation and this trusted Microsoft button click.
+                    try { finalMarker.target.click(); }
+                    catch (error) {
+                        clearSubmissionProof();
+                        throw error;
+                    }
+                    void save();
                 }
                 marker = null;
                 current = null;
@@ -631,6 +946,11 @@
             pause('安全凭据或页面操作失败，已暂停；密码不会重复领取');
         }
     }
-    if (location.origin === ORIGIN) void adminMain();
+    if (location.origin === ORIGIN) {
+        const bootstrap = readBootstrap(location.hash);
+        if (bootstrap && history?.replaceState) history.replaceState(null, '', location.pathname);
+        if (bootstrap) void bootstrapMain(bootstrap);
+        else void adminMain();
+    }
     else if (MS_HOSTS.includes(location.hostname)) void microsoftMain();
 })();

@@ -16,14 +16,19 @@ const { default: helperRoutes } = await import('./helper.routes.js');
 const { default: adminRoutes } = await import('../email-reauthorization/reauthorization.routes.js');
 const { AppError } = await import('../../plugins/error.js');
 const ID = '12345678-1234-4123-8123-123456789012';
+const SECOND_ID = '87654321-4321-4321-8321-210987654321';
 const UA = 'test-browser-agent';
 const CLEAR = 'test-only-mailbox-credential';
+const submittedLogin = (runId: string, bindingId: string, now: number) => ({
+    deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 2000 },
+    emailSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', email: 'target@outlook.com', submittedAt: now - 1000 },
+});
 
 async function runMicrosoftScenario(options: {
     url: string;
     tabTask?: Record<string, unknown>;
     values?: Record<string, unknown>;
-    view?: 'empty' | 'device' | 'email' | 'password' | 'consent' | 'password-consent' | 'password-continue';
+    view?: 'empty' | 'device' | 'picker' | 'password-choice' | 'email' | 'password' | 'stay' | 'consent' | 'password-consent' | 'password-continue';
     autoTicket?: boolean;
     stopAfterClicks?: number;
     formAction?: string;
@@ -31,12 +36,17 @@ async function runMicrosoftScenario(options: {
     submitFormAction?: string;
     submitFormMethod?: string;
     currentClientId?: string;
+    interruptSaveAfterClick?: boolean;
+    suppressSubmitEvent?: boolean;
+    clickView?: 'empty' | 'device' | 'picker' | 'password-choice' | 'email' | 'password' | 'stay' | 'consent' | 'password-consent' | 'password-continue';
+    entryHref?: string;
+    currentStatus?: 'PENDING' | 'SUCCEEDED';
     saveMutations?: Record<number, { url?: string; formAction?: string; formMethod?: string;
         submitFormAction?: string; submitFormMethod?: string }>;
 }) {
     const source = await readFile(new URL('../../../../web/public/gongxi-mail-reauthorization.user.js', import.meta.url), 'utf8');
     const executable = source.replace(
-        /[ ]{4}if \(location\.origin === ORIGIN\) void adminMain\(\);\r?\n[ ]{4}else if \(MS_HOSTS\.includes\(location\.hostname\)\) void microsoftMain\(\);/,
+        /[ ]{4}if \(location\.origin === ORIGIN\) \{[\s\S]*?\r?\n[ ]{4}\}\r?\n[ ]{4}else if \(MS_HOSTS\.includes\(location\.hostname\)\) void microsoftMain\(\);/,
         '    module.exports.microsoftMain = microsoftMain;',
     );
     assert.notEqual(executable, source, 'userscript test hook must replace the runtime dispatch');
@@ -65,7 +75,8 @@ async function runMicrosoftScenario(options: {
         disabled: false, innerText: text, textContent: text, value: '',
         getClientRects: () => [{}], getAttribute: () => null,
     });
-    const identity = makeNode('target@outlook.com');
+    let activeView = options.view;
+    const identity = makeNode(activeView === 'picker' ? 'cached@outlook.com' : 'target@outlook.com');
     const email = new TestInput();
     const password = new TestInput();
     const device = new TestInput();
@@ -73,6 +84,9 @@ async function runMicrosoftScenario(options: {
         options.view === 'password-continue' || options.view === 'device' ? 'Continue' :
             options.view === 'email' ? 'Next' : 'Sign in';
     const submit = makeNode(submitText);
+    const picker = makeNode('Use another account');
+    const passwordOption = makeNode('Use your password');
+    const no = makeNode('No');
     const submitAttributes: Record<string, string> = {};
     if (options.submitFormAction !== undefined) submitAttributes.formaction = options.submitFormAction;
     if (options.submitFormMethod !== undefined) submitAttributes.formmethod = options.submitFormMethod;
@@ -99,24 +113,54 @@ async function runMicrosoftScenario(options: {
         closest: () => form,
         click: () => {
         clicks++;
-        if (options.view === 'device') {
+        if (!options.suppressSubmitEvent && ['device', 'email', 'password'].includes(activeView ?? '')) {
             submitEvents++;
             for (const registered of [...submitListeners]) registered.listener();
             for (let index = submitListeners.length - 1; index >= 0; index--) {
                 if (submitListeners[index].once) submitListeners.splice(index, 1);
             }
         }
+        if (options.clickView) activeView = options.clickView;
         if (clicks >= (options.stopAfterClicks ?? Number.POSITIVE_INFINITY)) clickReached?.();
         },
     });
-    const bodyText = ['consent', 'password-consent'].includes(options.view ?? '') ? 'Permissions requested by this app' :
-        options.view === 'password-continue' ? 'Continue signing in to this app' : '';
+    Object.assign(picker, {
+        click: () => {
+            clicks++;
+            if (clicks >= (options.stopAfterClicks ?? Number.POSITIVE_INFINITY)) clickReached?.();
+        },
+    });
+    Object.assign(passwordOption, {
+        href: options.entryHref ?? '',
+        getAttribute: (name: string) => name === 'href' ? options.entryHref ?? null : null,
+        click: () => {
+            clicks++;
+            if (clicks >= (options.stopAfterClicks ?? Number.POSITIVE_INFINITY)) clickReached?.();
+        },
+    });
+    Object.assign(no, {
+        form,
+        formAction: '',
+        formMethod: '',
+        getAttribute: () => null,
+        closest: () => form,
+        click: () => {
+            clicks++;
+            if (clicks >= (options.stopAfterClicks ?? Number.POSITIVE_INFINITY)) clickReached?.();
+        },
+    });
+    const bodyText = () => ['consent', 'password-consent'].includes(activeView ?? '') ? 'Permissions requested by this app' :
+        activeView === 'password-continue' ? 'Continue signing in to this app' : activeView === 'stay' ? 'Stay signed in?' : '';
     const querySelectorAll = (selector: string) => {
-        if (selector.startsWith('#displayName,')) return ['password', 'consent', 'password-consent', 'password-continue'].includes(options.view ?? '') ? [identity] : [];
-        if (selector === '#i0116[name="loginfmt"]') return options.view === 'email' ? [email] : [];
-        if (selector === 'input#i0118[name="passwd"][type="password"]') return ['password', 'password-consent', 'password-continue'].includes(options.view ?? '') ? [password] : [];
-        if (selector === '#otc, input[name="user_code"]') return options.view === 'device' ? [device] : [];
-        if (selector === '#idSIButton9, #idSubmit_Consent, #idBtn_Accept') return options.view === 'empty' ? [] : [submit];
+        if (selector.startsWith('#displayName,')) return ['picker', 'password', 'stay', 'consent', 'password-consent', 'password-continue'].includes(activeView ?? '') ? [identity] : [];
+        if (selector === '#i0116[name="loginfmt"], #usernameEntry[type="email"][autocomplete~="username"]') return activeView === 'email' ? [email] : [];
+        if (selector === 'input#i0118[name="passwd"][type="password"], #passwordEntry[type="password"], input[type="password"][autocomplete="current-password"]') return ['password', 'password-consent', 'password-continue'].includes(activeView ?? '') ? [password] : [];
+        if (selector === '#otc, input[name="user_code"]') return activeView === 'device' ? [device] : [];
+        if (selector === '#idSIButton9, #idSubmit_Consent, #idBtn_Accept, form button[type="submit"]') return ['empty', 'picker'].includes(activeView ?? '') ? [] : [submit];
+        if (selector === '#otherTile, #idDiv_UseAnotherAccount') return activeView === 'picker' ? [picker] : [];
+        if (selector === 'button, a, [role="button"]') return activeView === 'password-choice' ? [passwordOption] : [];
+        if (selector === 'button, input[type="button"], input[type="submit"]') return activeView === 'stay' ? [no] : [];
+        if (selector.startsWith('#idDiv_SAOTCS_Proofs,')) return activeView === 'password-choice' ? [makeNode('verification')] : [];
         return [];
     };
     const makeElement = () => ({
@@ -125,7 +169,7 @@ async function runMicrosoftScenario(options: {
         attachShadow: () => ({ append: () => undefined }),
     });
     const documentValue = {
-        body: { innerText: bodyText, append: () => undefined },
+        body: { get innerText() { return bodyText(); }, append: () => undefined },
         createElement: makeElement,
         querySelectorAll,
     };
@@ -133,6 +177,7 @@ async function runMicrosoftScenario(options: {
     windowValue.top = windowValue;
     windowValue.self = windowValue;
     const tabState = options.tabTask ? { gongxiHelper: { ...options.tabTask } } : {};
+    let durableTabState = options.interruptSaveAfterClick ? structuredClone(tabState) : tabState;
     const values = new Map(Object.entries(options.values ?? {}));
     const requests: string[] = [];
     const handoffEvents: string[] = [];
@@ -155,7 +200,7 @@ async function runMicrosoftScenario(options: {
         GM_getTab: (done: (value: object) => void) => done(tabState),
         GM_saveTab: (() => {
             let saves = 0;
-            return (_value: object, done?: () => void) => {
+            return (value: object, done?: () => void) => {
                 saves++;
                 const mutation = options.saveMutations?.[saves];
                 if (mutation?.url) setLocation(mutation.url);
@@ -169,6 +214,8 @@ async function runMicrosoftScenario(options: {
                     submitAttributes.formmethod = mutation.submitFormMethod;
                     Object.assign(submit, { formMethod: mutation.submitFormMethod });
                 }
+                if (options.interruptSaveAfterClick && clicks > 0) return;
+                if (options.interruptSaveAfterClick) durableTabState = structuredClone(value);
                 done?.();
             };
         })(),
@@ -203,7 +250,7 @@ async function runMicrosoftScenario(options: {
                 } }, responseText: '' });
             } else if (path === 'current') {
                 request.onload({ finalUrl: request.url, status: 200, response: { success: true, data: {
-                    sessionId: ID, email: 'target@outlook.com', userCode: 'ABCD-EFGH', status: 'PENDING',
+                    sessionId: ID, email: 'target@outlook.com', userCode: 'ABCD-EFGH', status: options.currentStatus ?? 'PENDING',
                     clientId: options.currentClientId ?? 'client',
                     expiresAt: new Date(Date.now() + 60000).toISOString(),
                 } }, responseText: '' });
@@ -222,7 +269,246 @@ async function runMicrosoftScenario(options: {
     if (options.stopAfterClicks) await Promise.race([execution, reached]);
     else await execution;
     return { requests, clicks, submitEvents, inputValues: { device: device.value, email: email.value, password: password.value },
-        handoffEvents, tabState, values };
+        handoffEvents, tabState: durableTabState, values };
+}
+
+async function runAdminManualSuccessScenario(options: {
+    outOfOrderSessionRead?: boolean;
+    crossSessionDoubleContinue?: boolean;
+    exerciseStaleResponseGuard?: boolean;
+    pauseDuringContinue?: boolean;
+} = {}) {
+    const source = await readFile(new URL('../../../../web/public/gongxi-mail-reauthorization.user.js', import.meta.url), 'utf8');
+    let executable = source.replace(
+        /[ ]{4}if \(location\.origin === ORIGIN\) \{[\s\S]*?\r?\n[ ]{4}\}\r?\n[ ]{4}else if \(MS_HOSTS\.includes\(location\.hostname\)\) void microsoftMain\(\);/,
+        '    module.exports.adminMain = adminMain;',
+    );
+    assert.notEqual(executable, source, 'admin userscript test hook must replace the runtime dispatch');
+    if (options.exerciseStaleResponseGuard) {
+        const guarded = executable;
+        executable = executable.replace('                if (continuePending) return;\n                continuePending = true;',
+            '                continuePending = true;');
+        assert.notEqual(executable, guarded, 'the test must bypass only the click lock to exercise stale-response isolation');
+    }
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const secondBindingId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    let scenarioNow = Date.now();
+    class ScenarioDate extends Date {
+        constructor(value?: string | number) {
+            if (value === undefined) super(scenarioNow);
+            else super(value);
+        }
+        static override now() { return scenarioNow; }
+    }
+    const buttons = new Map<string, () => void>();
+    const makeElement = () => {
+        const element = {
+            id: '', style: { cssText: '' }, textContent: '',
+            append: (..._children: unknown[]) => undefined,
+            attachShadow: () => ({ append: (..._children: unknown[]) => undefined }),
+            addEventListener: (type: string, listener: () => void) => {
+                if (type === 'click') buttons.set(element.textContent, listener);
+            },
+        };
+        return element;
+    };
+    const values = new Map<string, unknown>([['gongxi-helper-worker-v1', {
+        runId, sessionId: ID, bindingId, heartbeat: scenarioNow, paused: true, freshLogin: false, reason: '人工验证',
+    }]]);
+    const controlHistory: Record<string, unknown>[] = [];
+    let candidateReads = 0;
+    let sessionReads = 0;
+    let secondSessionReads = 0;
+    let ticketReads = 0;
+    let releaseStaleSessionRead: (() => void) | undefined;
+    let releaseLateSucceededRead: (() => void) | undefined;
+    let lateSucceededReadResolved = false;
+    let openedTab: { closed: boolean; close: () => void } | null = null;
+    const session = (status: 'PENDING' | 'SUCCEEDED', sessionId = ID) => ({
+        sessionId, email: sessionId === ID ? 'target@outlook.com' : 'second@outlook.com', status, clientId: 'client',
+        verificationUri: 'https://www.microsoft.com/link',
+        nextPollAt: new ScenarioDate(scenarioNow + 60000).toISOString(), serverTime: new ScenarioDate().toISOString(),
+    });
+    const moduleValue: { exports: { adminMain?: () => Promise<void> } } = { exports: {} };
+    const sandbox = {
+        module: moduleValue,
+        document: {
+            body: { append: (..._children: unknown[]) => undefined },
+            createElement: makeElement,
+            documentElement: {
+                setAttribute: (_name: string, _value: string) => undefined,
+                removeAttribute: (_name: string) => undefined,
+            },
+        },
+        window: { top: null, self: null, addEventListener: (_type: string, _listener: () => void) => undefined },
+        location: { origin: 'https://outlook.wujiaqiao.dpdns.org', protocol: 'https:',
+            hostname: 'outlook.wujiaqiao.dpdns.org', pathname: '/reauthorizations', hash: '',
+            href: 'https://outlook.wujiaqiao.dpdns.org/reauthorizations' },
+        history: { replaceState: () => undefined },
+        navigator: { locks: { request: async (_name: string, _options: object,
+            action: (lock: object) => Promise<void>) => action({}) } },
+        crypto: { randomUUID: (() => {
+            const ids = [runId, bindingId, secondBindingId];
+            return () => ids.shift() ?? 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+        })() },
+        localStorage: { getItem: (key: string) => key === 'token' ? 'admin-jwt' : null },
+        URL, URLSearchParams, btoa, atob, JSON, Date: ScenarioDate,
+        setTimeout: (callback: (...args: unknown[]) => void, delay = 0, ...args: unknown[]) => {
+            scenarioNow += Math.max(0, delay);
+            return setTimeout(callback, 0, ...args);
+        },
+        clearTimeout,
+        setInterval: () => 1,
+        clearInterval: (_handle: number) => undefined,
+        fetch: async (raw: string, init?: { method?: string }) => {
+            const url = new URL(raw);
+            let data: unknown;
+            if (url.pathname.endsWith('/candidates')) {
+                candidateReads++;
+                data = candidateReads === 1 ? [{ supported: true, emailId: 7, activeSession: session('PENDING') }] :
+                    (options.crossSessionDoubleContinue || options.exerciseStaleResponseGuard) && candidateReads === 2
+                        ? [{ supported: true, emailId: 8, activeSession: session('PENDING', SECOND_ID) }]
+                        : [];
+            } else if (url.pathname.endsWith('/helper-ticket') && init?.method === 'POST') {
+                ticketReads++;
+                data = { ticket: 't'.repeat(43), expiresAt: new ScenarioDate(scenarioNow + 60000).toISOString() };
+            } else if (url.pathname.endsWith(`/${ID}`)) {
+                sessionReads++;
+                if ((options.outOfOrderSessionRead || options.crossSessionDoubleContinue || options.pauseDuringContinue ||
+                    options.exerciseStaleResponseGuard) && sessionReads === 2) {
+                    data = await new Promise<ReturnType<typeof session>>((resolve) => {
+                        releaseStaleSessionRead = () => resolve(session('PENDING'));
+                    });
+                } else if ((options.pauseDuringContinue && sessionReads === 3) ||
+                    (options.exerciseStaleResponseGuard && sessionReads === 4)) {
+                    data = await new Promise<ReturnType<typeof session>>((resolve) => {
+                        releaseLateSucceededRead = () => {
+                            lateSucceededReadResolved = true;
+                            resolve(session('SUCCEEDED'));
+                        };
+                    });
+                } else {
+                    data = session(sessionReads === 1 ? 'PENDING' : 'SUCCEEDED');
+                }
+            } else if (url.pathname.endsWith(`/${SECOND_ID}`)) {
+                secondSessionReads++;
+                const secondWorker = values.get('gongxi-helper-worker-v1') as Record<string, unknown> | undefined;
+                if (secondWorker?.sessionId === SECOND_ID) {
+                    values.set('gongxi-helper-worker-v1', { ...secondWorker, heartbeat: scenarioNow });
+                }
+                data = session('PENDING', SECOND_ID);
+                if (options.exerciseStaleResponseGuard && secondSessionReads === 1) {
+                    setTimeout(() => releaseLateSucceededRead?.(), 0);
+                }
+            } else {
+                throw new Error(`unexpected admin request ${url.pathname}`);
+            }
+            return { ok: true, json: async () => ({ success: true, data }) };
+        },
+        GM_getValue: (key: string, fallback: unknown) => {
+            if (values.has(key)) return values.get(key);
+            if (key.startsWith('gongxi-helper-binding-v2:')) {
+                const control = values.get('gongxi-helper-control-v1') as Record<string, unknown> | undefined;
+                const requestedBindingId = key.slice('gongxi-helper-binding-v2:'.length);
+                if (control?.runId === runId && control.bindingId === requestedBindingId) {
+                    return { runId, sessionId: control.sessionId, bindingId: requestedBindingId, boundAt: control.handoffAt };
+                }
+            }
+            return fallback;
+        },
+        GM_setValue: (key: string, value: unknown) => {
+            values.set(key, value);
+            if (key === 'gongxi-helper-control-v1') {
+                const control = value as Record<string, unknown>;
+                controlHistory.push(structuredClone(control));
+                if ((options.crossSessionDoubleContinue || options.exerciseStaleResponseGuard) &&
+                    control.sessionId === SECOND_ID && control.bindingId === secondBindingId) {
+                    values.set('gongxi-helper-worker-v1', {
+                        runId, sessionId: SECOND_ID, bindingId: secondBindingId,
+                        heartbeat: Math.max(scenarioNow, control.handoffAt as number),
+                        paused: false, freshLogin: true, freshLoginAt: control.handoffAt,
+                    });
+                }
+            }
+        },
+        GM_deleteValue: (key: string) => { values.delete(key); },
+        GM_openInTab: () => {
+            openedTab = { closed: false, close() { this.closed = true; } };
+            return openedTab;
+        },
+    };
+    Object.assign(sandbox.window, { top: sandbox.window, self: sandbox.window });
+    runInNewContext(executable, sandbox, { timeout: 1000 });
+    assert.ok(moduleValue.exports.adminMain);
+    await moduleValue.exports.adminMain();
+    const start = buttons.get('启动 / 继续队列');
+    const pause = buttons.get('暂停（当前项转人工）');
+    const finish = buttons.get('结束助手 / 切换人工');
+    assert.ok(start && pause && finish);
+    start();
+    const waitFor = async (predicate: () => boolean) => {
+        for (let attempts = 0; attempts < 200; attempts++) {
+            if (predicate()) return;
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        assert.fail('admin userscript scenario timed out');
+    };
+    await waitFor(() => {
+        const control = values.get('gongxi-helper-control-v1') as Record<string, unknown> | undefined;
+        return control?.state === 'paused' && control.manual === true;
+    });
+    if (options.outOfOrderSessionRead || options.crossSessionDoubleContinue || options.exerciseStaleResponseGuard ||
+        options.pauseDuringContinue) {
+        await waitFor(() => sessionReads === 2);
+    }
+    const generationBeforeContinue = (values.get('gongxi-helper-control-v1') as { generation?: number }).generation;
+    start();
+    if (options.pauseDuringContinue) {
+        await waitFor(() => !!releaseLateSucceededRead);
+        pause();
+        releaseLateSucceededRead?.();
+        releaseStaleSessionRead?.();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const controlBeforeFinish = structuredClone(values.get('gongxi-helper-control-v1') as Record<string, unknown>);
+        finish();
+        return { bindingId, secondBindingId, candidateReads, sessionReads, secondSessionReads, ticketReads,
+            controlHistory, openedTab, controlBeforeFinish, generationBeforeContinue,
+            lateSucceededReadWasIssued: true, lateSucceededReadResolved };
+    }
+    if (options.crossSessionDoubleContinue || options.exerciseStaleResponseGuard) {
+        start();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    await waitFor(() => controlHistory.some((control) => {
+        const proof = control.manualSuccess as Record<string, unknown> | undefined;
+        return control.state === 'running' && control.manual === false && proof?.sessionId === ID;
+    }));
+    const proofIndex = controlHistory.findIndex((control) => {
+        const proof = control.manualSuccess as Record<string, unknown> | undefined;
+        return control.state === 'running' && control.manual === false && proof?.sessionId === ID;
+    });
+    if (options.outOfOrderSessionRead || options.crossSessionDoubleContinue || options.exerciseStaleResponseGuard) {
+        const release = releaseStaleSessionRead;
+        assert.ok(release);
+        release();
+    }
+    await waitFor(() => controlHistory.slice(proofIndex + 1).some((control) =>
+        control.sessionId === null && control.bindingId === null && control.manualSuccess === null));
+    const cleanup = controlHistory.slice(proofIndex + 1).find((control) =>
+        control.sessionId === null && control.bindingId === null && control.manualSuccess === null);
+    if (cleanup?.state === 'running') await waitFor(() => candidateReads === 2);
+    let controlBeforeFinish: Record<string, unknown> | undefined;
+    if (options.crossSessionDoubleContinue || options.exerciseStaleResponseGuard) {
+        await waitFor(() => ticketReads === 2 && secondSessionReads > 0);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        controlBeforeFinish = structuredClone(values.get('gongxi-helper-control-v1') as Record<string, unknown>);
+    }
+    finish();
+    return { bindingId, secondBindingId, candidateReads, sessionReads, secondSessionReads, ticketReads,
+        controlHistory, openedTab, controlBeforeFinish, generationBeforeContinue,
+        lateSucceededReadWasIssued: !!releaseLateSucceededRead,
+        lateSucceededReadResolved };
 }
 
 function fixture() {
@@ -536,7 +822,7 @@ void test('an existing bound task cannot claim its ticket after unrelated naviga
     assert.equal(result.values.has(`gongxi-helper-ticket-v2:${bindingId}`), false);
 });
 
-void test('a bound device tab claims once, saves observed submission proof, then fills a matching password page', async () => {
+void test('a bound device tab claims once, submits a fresh account, then fills a matching password page without client_id URLs', async () => {
     const now = Date.now();
     const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -563,12 +849,27 @@ void test('a bound device tab claims once, saves observed submission proof, then
     assert.equal(Number.isFinite(proof.submittedAt), true);
     assert.equal(saved.capability, 'c'.repeat(43));
 
-    const passwordResult = await runMicrosoftScenario({
-        url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=client',
-        view: 'password',
+    const emailResult = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/login',
+        view: 'email',
         stopAfterClicks: 1,
         tabTask: saved,
         values: Object.fromEntries(deviceResult.values),
+    });
+    assert.deepEqual(emailResult.requests, ['current']);
+    assert.equal(emailResult.clicks, 1);
+    assert.equal(emailResult.inputValues.email, 'target@outlook.com');
+    const emailTask = (emailResult.tabState as { gongxiHelper: Record<string, unknown> }).gongxiHelper;
+    assert.deepEqual({ ...(emailTask.emailSubmission as object), submittedAt: 0 }, {
+        runId, sessionId: ID, bindingId, clientId: 'client', email: 'target@outlook.com', submittedAt: 0,
+    });
+
+    const passwordResult = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/login',
+        view: 'password',
+        stopAfterClicks: 1,
+        tabTask: emailTask,
+        values: Object.fromEntries(emailResult.values),
     });
     assert.deepEqual(passwordResult.requests, ['current', 'password']);
     assert.equal(passwordResult.clicks, 1);
@@ -578,13 +879,228 @@ void test('a bound device tab claims once, saves observed submission proof, then
     assert.equal(passwordTask.identityVerified, true);
 });
 
+void test('device and email submit proofs survive navigation interrupting GM_saveTab callbacks', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const boundAt = now - 1000;
+    const control = { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false, handoffAt: boundAt };
+    const values = {
+        'gongxi-helper-control-v1': control,
+        'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+    };
+    const deviceResult = await runMicrosoftScenario({
+        url: 'https://www.microsoft.com/link',
+        view: 'device',
+        stopAfterClicks: 1,
+        interruptSaveAfterClick: true,
+        suppressSubmitEvent: true,
+        tabTask: { runId, sessionId: ID, bindingId, boundAt, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), actions: {} },
+        values,
+    });
+    const deviceTask = (deviceResult.tabState as { gongxiHelper: Record<string, unknown> }).gongxiHelper;
+    assert.equal(deviceTask.deviceSubmission, undefined, 'the simulated navigation must discard the tab save');
+    const deviceReceipt = deviceResult.values.get('gongxi-helper-submission-v1') as Record<string, unknown>;
+    assert.deepEqual({ runId: deviceReceipt.runId, sessionId: deviceReceipt.sessionId,
+        bindingId: deviceReceipt.bindingId, clientId: deviceReceipt.clientId },
+        { runId, sessionId: ID, bindingId, clientId: 'client' });
+    assert.equal(JSON.stringify(deviceReceipt).includes('c'.repeat(43)), false, 'the capability must remain tab-private');
+    assert.equal(JSON.stringify(deviceReceipt).includes(CLEAR), false, 'the password must never enter shared proof storage');
+
+    const emailResult = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/login',
+        view: 'email',
+        stopAfterClicks: 1,
+        interruptSaveAfterClick: true,
+        tabTask: deviceTask,
+        values: Object.fromEntries(deviceResult.values),
+    });
+    assert.equal(emailResult.clicks, 1, 'the next document must recover the device submit proof');
+    const emailTask = (emailResult.tabState as { gongxiHelper: Record<string, unknown> }).gongxiHelper;
+    assert.equal(emailTask.emailSubmission, undefined, 'the simulated navigation must discard the email tab save');
+    const emailReceipt = emailResult.values.get('gongxi-helper-submission-v1') as { emailSubmission?: unknown };
+    assert.ok(emailReceipt.emailSubmission, 'the verified email-button invocation must synchronously replace the durable receipt');
+
+    const passwordResult = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/login',
+        view: 'password',
+        stopAfterClicks: 1,
+        interruptSaveAfterClick: true,
+        tabTask: emailTask,
+        values: Object.fromEntries(emailResult.values),
+    });
+    assert.deepEqual(passwordResult.requests, ['current', 'password']);
+    assert.equal(passwordResult.clicks, 1, 'the password boundary must require the recovered email submit proof');
+    assert.equal(passwordResult.inputValues.password, CLEAR);
+    const passwordTask = (passwordResult.tabState as { gongxiHelper: Record<string, unknown> }).gongxiHelper;
+    assert.equal(passwordTask.passwordSubmission, undefined, 'navigation must be able to interrupt the tab save after password click');
+    const passwordWorker = passwordResult.values.get('gongxi-helper-worker-v1') as { freshLogin?: boolean; freshLoginAt?: number };
+    assert.equal(passwordWorker.freshLogin, true);
+    assert.equal(Number.isFinite(passwordWorker.freshLoginAt), true);
+
+    const stayResult = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/login',
+        view: 'stay',
+        stopAfterClicks: 1,
+        tabTask: passwordTask,
+        values: Object.fromEntries(passwordResult.values),
+    });
+    assert.equal(stayResult.clicks, 1);
+    const inheritedWorker = stayResult.values.get('gongxi-helper-worker-v1') as { freshLogin?: boolean; freshLoginAt?: number };
+    assert.equal(inheritedWorker.freshLogin, true);
+    assert.equal(inheritedWorker.freshLoginAt, passwordWorker.freshLoginAt,
+        'the next document must retain the validated password-click timestamp');
+});
+
+void test('a local password submission restores fresh-login proof only for the bound, post-handoff, non-future click', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const handoffAt = now - 2000;
+    const run = async (passwordSubmission: Record<string, unknown>) => {
+        const result = await runMicrosoftScenario({
+            url: 'https://login.microsoftonline.com/common/login',
+            view: 'empty',
+            currentStatus: 'SUCCEEDED',
+            tabTask: {
+                runId, sessionId: ID, bindingId, boundAt: handoffAt, expiresAt: now + 60000,
+                capability: 'c'.repeat(43), actions: {}, passwordSubmission,
+            },
+            values: {
+                'gongxi-helper-control-v1': {
+                    state: 'running', runId, sessionId: ID, bindingId, heartbeat: now,
+                    manual: false, handoffAt,
+                },
+                'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+            },
+        });
+        return result.values.get('gongxi-helper-worker-v1') as { freshLogin?: boolean; freshLoginAt?: number };
+    };
+    const submission = {
+        runId, sessionId: ID, bindingId, clientId: 'client', email: 'target@outlook.com', submittedAt: now - 1000,
+    };
+    const restored = await run(submission);
+    assert.equal(restored.freshLogin, true, 'the tab-local click proof must survive a missing shared worker record');
+    assert.equal(restored.freshLoginAt, submission.submittedAt);
+    assert.equal((await run({ ...submission, bindingId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' })).freshLogin, false,
+        'a local proof from another binding must be rejected');
+    assert.equal((await run({ ...submission, submittedAt: handoffAt - 1 })).freshLogin, false,
+        'a local proof from before this handoff must be rejected');
+    assert.equal((await run({ ...submission, submittedAt: Date.now() + 60000 })).freshLogin, false,
+        'a future local proof must be rejected');
+});
+
+void test('admin manual success advances once without a stale worker restoring paused state', async () => {
+    const result = await runAdminManualSuccessScenario();
+    const proofIndex = result.controlHistory.findIndex((control) => {
+        const proof = control.manualSuccess as Record<string, unknown> | undefined;
+        return control.state === 'running' && control.manual === false && proof?.sessionId === ID;
+    });
+    assert.notEqual(proofIndex, -1, 'the continue click must record the backend-confirmed manual success');
+    const proofControl = result.controlHistory[proofIndex];
+    assert.deepEqual(proofControl.manualSuccess, {
+        runId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', sessionId: ID,
+        bindingId: result.bindingId, confirmedAt: (proofControl.manualSuccess as { confirmedAt: number }).confirmedAt,
+    });
+    assert.equal(Number.isFinite((proofControl.manualSuccess as { confirmedAt: number }).confirmedAt), true);
+    const cleanupIndex = result.controlHistory.findIndex((control, index) => index > proofIndex &&
+        control.state === 'running' && control.sessionId === null && control.bindingId === null && control.manualSuccess === null);
+    assert.notEqual(cleanupIndex, -1, 'the verified item must be cleared so the queue can select the next item');
+    assert.equal(result.controlHistory.slice(proofIndex + 1, cleanupIndex).some((control) => control.state === 'paused'), false,
+        'the stale paused worker must not overwrite the verified manual-success transition');
+    assert.equal(result.ticketReads, 1, 'manual recovery must not issue another helper ticket');
+    assert.ok(result.sessionReads >= 2, 'the backend session must be observed as SUCCEEDED before cleanup');
+    assert.equal(result.candidateReads, 2, 'the queue must automatically ask for the next candidate after cooldown');
+});
+
+void test('pausing while manual-success verification is in flight invalidates the late success', async () => {
+    const result = await runAdminManualSuccessScenario({ pauseDuringContinue: true });
+    assert.equal(result.lateSucceededReadResolved, true, 'the delayed success must actually arrive after the pause');
+    assert.equal(result.controlBeforeFinish?.state, 'paused');
+    assert.equal(result.controlBeforeFinish?.manual, true);
+    assert.equal(result.controlBeforeFinish?.sessionId, ID);
+    assert.equal(result.controlBeforeFinish?.bindingId, result.bindingId);
+    assert.equal(result.controlBeforeFinish?.manualSuccess, null);
+    assert.ok((result.controlBeforeFinish?.generation as number) > (result.generationBeforeContinue ?? -1),
+        'pause must advance and publish the generation that guards in-flight requests');
+    assert.equal(result.candidateReads, 1, 'the late success must not advance from A to candidate B');
+    assert.equal(result.secondSessionReads, 0, 'candidate B must never start');
+    assert.equal(result.ticketReads, 1, 'the late success must not issue a helper ticket for B');
+});
+
+void test('admin manual success ignores an older pending response that arrives out of order', async () => {
+    const result = await runAdminManualSuccessScenario({ outOfOrderSessionRead: true });
+    const proofIndex = result.controlHistory.findIndex((control) => {
+        const proof = control.manualSuccess as Record<string, unknown> | undefined;
+        return control.state === 'running' && control.manual === false && proof?.sessionId === ID;
+    });
+    assert.notEqual(proofIndex, -1);
+    const cleanupIndex = result.controlHistory.findIndex((control, index) => index > proofIndex &&
+        control.state === 'running' && control.sessionId === null && control.bindingId === null && control.manualSuccess === null);
+    assert.notEqual(cleanupIndex, -1, 'the late PENDING response must not leave the cleaned queue paused');
+    assert.equal(result.controlHistory.slice(proofIndex + 1, cleanupIndex).some((control) => control.state === 'paused'), false);
+    assert.equal(result.candidateReads, 2, 'one continue click must advance to the next candidate');
+});
+
+void test('double continue cannot let a late succeeded response for the prior session clear the active next session', async () => {
+    const result = await runAdminManualSuccessScenario({ crossSessionDoubleContinue: true });
+    assert.equal(result.lateSucceededReadWasIssued, false,
+        'the second continue click must not start another verification request while the first is pending');
+    assert.deepEqual(result.controlBeforeFinish, {
+        runId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', state: 'running', sessionId: SECOND_ID,
+        bindingId: result.secondBindingId, manual: false,
+        heartbeat: result.controlBeforeFinish?.heartbeat,
+        generation: result.controlBeforeFinish?.generation,
+        handoffAt: result.controlBeforeFinish?.handoffAt,
+        manualSuccess: null,
+        reason: '',
+    });
+    assert.equal(result.candidateReads, 2, 'the active second session must not be cleaned or advance the queue');
+    assert.ok(result.secondSessionReads > 0, 'the second session must have actually entered backend polling');
+});
+
+void test('a delayed succeeded response for the prior session is discarded after the next session becomes current', async () => {
+    const result = await runAdminManualSuccessScenario({ exerciseStaleResponseGuard: true });
+    assert.equal(result.lateSucceededReadWasIssued, true);
+    assert.equal(result.lateSucceededReadResolved, true);
+    assert.equal(result.controlBeforeFinish?.sessionId, SECOND_ID);
+    assert.equal(result.controlBeforeFinish?.bindingId, result.secondBindingId);
+    assert.equal(result.controlBeforeFinish?.state, 'running');
+    assert.equal(result.controlBeforeFinish?.manual, false);
+    assert.equal(result.candidateReads, 2, 'the stale success must not clear B or advance to another candidate');
+});
+
 void test('a bound session still fills and submits a standard email page', async () => {
     const now = Date.now();
     const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
     const result = await runMicrosoftScenario({
-        url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=client',
+        url: 'https://login.microsoftonline.com/common/login',
         view: 'email',
+        stopAfterClicks: 1,
+        tabTask: {
+            runId, sessionId: ID, bindingId, boundAt: now - 2000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), actions: { device: true },
+            deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 1000 },
+        },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 1);
+    assert.equal(result.inputValues.email, 'target@outlook.com');
+});
+
+void test('an account picker with cached identities chooses use another account without requiring a form', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/oauth2/authorize',
+        view: 'picker',
         stopAfterClicks: 1,
         tabTask: {
             runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
@@ -597,7 +1113,94 @@ void test('a bound session still fills and submits a standard email page', async
     });
     assert.deepEqual(result.requests, ['current']);
     assert.equal(result.clicks, 1);
-    assert.equal(result.inputValues.email, 'target@outlook.com');
+});
+
+void test('a passwordless-first verification page chooses the explicit password alternative', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.live.com/oauth20_remoteconnect.srf',
+        view: 'password-choice',
+        stopAfterClicks: 1,
+        tabTask: {
+            runId, sessionId: ID, bindingId, boundAt: now - 3000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), actions: { device: true, email: true },
+            ...submittedLogin(runId, bindingId, now),
+        },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 1);
+});
+
+void test('a password alternative with an untrusted entry target pauses', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.live.com/oauth20_remoteconnect.srf',
+        view: 'password-choice',
+        entryHref: 'https://evil.example/collect',
+        tabTask: {
+            runId, sessionId: ID, bindingId, boundAt: now - 3000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), actions: { device: true, email: true },
+            ...submittedLogin(runId, bindingId, now),
+        },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 0);
+});
+
+void test('the current stay-signed-in layout chooses the explicit negative option', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.live.com/ppsecure/post.srf',
+        view: 'stay',
+        stopAfterClicks: 1,
+        tabTask: {
+            runId, sessionId: ID, bindingId, boundAt: now - 4000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), passwordSent: true,
+            actions: { device: true, email: true, password: true },
+            ...submittedLogin(runId, bindingId, now),
+        },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 1);
+});
+
+void test('a cached matching password page pauses until this bound flow submitted the queued email', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.live.com/oauth20_remoteconnect.srf',
+        view: 'password',
+        tabTask: {
+            runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
+            deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 1000 },
+        },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 0);
+    assert.equal(result.inputValues.password, '');
 });
 
 void test('a password form whose submit button overrides POST with GET pauses before password claim', async () => {
@@ -611,7 +1214,7 @@ void test('a password form whose submit button overrides POST with GET pauses be
         submitFormMethod: 'get',
         tabTask: {
             runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
-            deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 1000 },
+            ...submittedLogin(runId, bindingId, now),
         },
         values: {
             'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
@@ -638,7 +1241,7 @@ for (const target of [
             submitFormAction: target.url,
             tabTask: {
                 runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
-                deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 1000 },
+                ...submittedLogin(runId, bindingId, now),
             },
             values: {
                 'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
@@ -665,7 +1268,7 @@ for (const mutation of [
             saveMutations: { 1: mutation.value },
             tabTask: {
                 runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
-                deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 1000 },
+                ...submittedLogin(runId, bindingId, now),
             },
             values: {
                 'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
@@ -688,7 +1291,7 @@ void test('a target change while saving a filled password clears it and never cl
         saveMutations: { 2: { submitFormAction: 'https://evil.example/collect?client_id=client' } },
         tabTask: {
             runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
-            deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 1000 },
+            ...submittedLogin(runId, bindingId, now),
         },
         values: {
             'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
@@ -697,6 +1300,28 @@ void test('a target change while saving a filled password clears it and never cl
     });
     assert.deepEqual(result.requests, ['current', 'password']);
     assert.equal(result.clicks, 0);
+    assert.equal(result.inputValues.password, '');
+});
+
+void test('a password click that does not navigate is cleared when the resulting page pauses', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.microsoftonline.com/common/login',
+        view: 'password',
+        clickView: 'consent',
+        tabTask: {
+            runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
+            ...submittedLogin(runId, bindingId, now),
+        },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests.slice(0, 3), ['current', 'password', 'current']);
+    assert.equal(result.clicks, 1);
     assert.equal(result.inputValues.password, '');
 });
 
@@ -710,7 +1335,7 @@ for (const view of ['password-consent', 'password-continue'] as const) {
             view,
             tabTask: {
                 runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
-                deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 1000 },
+                ...submittedLogin(runId, bindingId, now),
             },
             values: {
                 'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
@@ -725,7 +1350,6 @@ for (const view of ['password-consent', 'password-continue'] as const) {
 
 for (const scenario of [
     { name: 'an unrelated OAuth client', url: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=unrelated-client' },
-    { name: 'a page without an explicit OAuth client', url: 'https://login.microsoftonline.com/common/login' },
 ] as const) {
     void test(`a matching password page for ${scenario.name} pauses before requesting the password`, async () => {
         const now = Date.now();
@@ -736,7 +1360,7 @@ for (const scenario of [
             view: 'password',
             tabTask: {
                 runId, sessionId: ID, bindingId, expiresAt: now + 60000, capability: 'c'.repeat(43), actions: {},
-                deviceSubmission: { runId, sessionId: ID, bindingId, clientId: 'client', submittedAt: now - 1000 },
+                ...submittedLogin(runId, bindingId, now),
             },
             values: {
                 'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
@@ -812,24 +1436,33 @@ void test('a submitted device-code proof cannot authorize consent for an unrelat
 
 void test('userscript policy pauses challenges, unknown identities and stale controls; grants stay narrow', async () => {
     const source = await readFile(new URL('../../../../web/public/gongxi-mail-reauthorization.user.js', import.meta.url), 'utf8');
-    const sandbox = { module: { exports: {} as {
+    const sandbox = { URL, URLSearchParams, btoa, atob, JSON, module: { exports: {} as {
         decide: (view: Record<string, unknown>, expectedEmail: string, expectedClientId: string, progress: Record<string, unknown>) => string;
         mayAct: (control: Record<string, unknown>, tab: Record<string, unknown>, now: number) => boolean;
         devicePath: (host: string, path: string) => boolean;
+        verificationTarget: (session: Record<string, unknown>, fragment: string) => string | null;
+        bootstrapTarget: (session: Record<string, unknown>, bindingId: string, runId: string) => string | null;
+        recoverSubmissionProofs: (stored: Record<string, unknown>, progress: Record<string, unknown>,
+            expectedEmail: string, expectedClientId: string, now: number) => Record<string, unknown> | null;
         workerRequiresPause: (control: Record<string, unknown>, worker: Record<string, unknown>, now: number) => boolean;
+        workerConfirmedFreshLogin: (control: Record<string, unknown>, worker: Record<string, unknown>, now: number) => boolean;
+        manualSuccessConfirmed: (control: Record<string, unknown>, session: Record<string, unknown>, now: number) => boolean;
     } } };
     runInNewContext(source, sandbox, { timeout: 1000 });
     const policy = sandbox.module.exports;
     const deviceSubmission = { runId: 'r', sessionId: ID, bindingId: 'b', clientId: 'client', submittedAt: 1500 };
-    const submitted = { runId: 'r', sessionId: ID, bindingId: 'b', deviceSubmission };
+    const submitted = { runId: 'r', sessionId: ID, bindingId: 'b', deviceSubmission,
+        emailSubmission: { runId: 'r', sessionId: ID, bindingId: 'b', clientId: 'client', email: 'target@outlook.com', submittedAt: 1600 } };
     assert.equal(policy.decide({ identities: [], password: true, clientIds: ['client'] }, 'target@outlook.com', 'client', {}), 'pause');
     assert.equal(policy.decide({ identities: ['target@outlook.com'], password: true, clientIds: ['client'] }, 'TARGET@outlook.com', 'client', {}), 'pause');
-    assert.equal(policy.decide({ identities: ['target@outlook.com'], password: true, clientIds: [] }, 'TARGET@outlook.com', 'client', submitted), 'pause');
+    assert.equal(policy.decide({ identities: ['target@outlook.com'], password: true, clientIds: [] }, 'TARGET@outlook.com', 'client', submitted), 'password');
     assert.equal(policy.decide({ identities: ['target@outlook.com'], password: true, clientIds: ['unrelated'] }, 'TARGET@outlook.com', 'client', submitted), 'pause');
     assert.equal(policy.decide({ identities: ['target@outlook.com'], password: true, clientIds: ['client', 'client'] }, 'TARGET@outlook.com', 'client', submitted), 'password');
     assert.equal(policy.decide({ identities: ['target@outlook.com'], password: true, clientIds: ['client'] }, 'TARGET@outlook.com', 'client',
         { ...submitted, deviceSubmission: { ...deviceSubmission, clientId: 'tampered' } }), 'pause');
     assert.equal(policy.decide({ identities: ['other@outlook.com'], password: true, clientIds: ['client'] }, 'target@outlook.com', 'client', {}), 'mismatch');
+    assert.equal(policy.decide({ identities: ['cached@outlook.com'], picker: true, clientIds: [] }, 'target@outlook.com', 'client',
+        { ...submitted, emailSubmission: undefined }), 'choose-other');
     for (const field of ['challenge', 'error']) assert.equal(policy.decide({ identities: [], device: true, devicePath: true, [field]: true }, 'a@b.com', 'client', {}), 'pause');
     assert.equal(policy.decide({ identities: [], email: true, clientIds: ['client'] }, 'a@b.com', 'client', { ...submitted, identityVerified: true }), 'email');
     assert.equal(policy.decide({ identities: [], email: true, clientIds: ['client'] }, 'a@b.com', 'client', { identityVerified: true }), 'pause');
@@ -837,20 +1470,70 @@ void test('userscript policy pauses challenges, unknown identities and stale con
         assert.equal(policy.decide({ identities: [], [field]: true, clientIds: ['client'] }, 'a@b.com', 'client', { ...submitted, identityVerified: true }), 'pause');
         assert.equal(policy.decide({ identities: ['a@b.com'], [field]: true, clientIds: ['client'] }, 'a@b.com', 'client', submitted), 'pause');
     }
+    const proofTask = { ...submitted, boundAt: 1000, expiresAt: 5000, actions: { device: true, email: true } };
+    const storedProof = { version: 1, runId: 'r', sessionId: ID, bindingId: 'b', clientId: 'client',
+        email: 'target@outlook.com', boundAt: 1000, expiresAt: 5000, deviceSubmission,
+        emailSubmission: submitted.emailSubmission };
+    assert.ok(policy.recoverSubmissionProofs(storedProof, proofTask, 'TARGET@outlook.com', 'client', 2000));
+    for (const [field, value] of [['runId', 'other'], ['sessionId', 'other'], ['bindingId', 'other'], ['clientId', 'other']] as const) {
+        assert.equal(policy.recoverSubmissionProofs({ ...storedProof, [field]: value }, proofTask,
+            'target@outlook.com', 'client', 2000), null, `shared proof must bind ${field}`);
+    }
     const control = { state: 'running', runId: 'r', sessionId: ID, bindingId: 'b', heartbeat: 1000, manual: false };
     const tab = { runId: 'r', sessionId: ID, bindingId: 'b', expiresAt: 50000 };
     assert.equal(policy.mayAct(control, tab, 2000), true);
     assert.equal(policy.mayAct({ ...control, manual: true }, tab, 2000), false);
     assert.equal(policy.mayAct(control, tab, 22000), false);
+    for (const heartbeat of [Number.NaN, Number.POSITIVE_INFINITY, 3000]) {
+        assert.equal(policy.mayAct({ ...control, heartbeat }, tab, 2000), false);
+    }
     assert.equal(policy.mayAct(control, { ...tab, sessionId: 'other' }, 2000), false);
     assert.equal(policy.mayAct(control, { ...tab, bindingId: 'other' }, 2000), false);
     assert.equal(policy.devicePath('login.microsoftonline.com', '/common/oauth2/deviceauth'), true);
+    assert.equal(policy.devicePath('www.microsoft.com', '/link'), true);
     assert.equal(policy.devicePath('evil.example', '/common/oauth2/deviceauth'), false);
+    assert.equal(policy.verificationTarget({ verificationUri: 'https://www.microsoft.com/link' }, 'gongxi-helper=test'),
+        'https://www.microsoft.com/link#gongxi-helper=test');
+    assert.equal(policy.verificationTarget({ verificationUri: 'https://evil.example/link' }, 'gongxi-helper=test'), null);
+    const bootstrap = policy.bootstrapTarget({ sessionId: ID, verificationUri: 'https://www.microsoft.com/link' },
+        'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+    assert.ok(bootstrap);
+    const bootstrapUrl = new URL(bootstrap);
+    assert.equal(bootstrapUrl.origin, 'https://outlook.wujiaqiao.dpdns.org');
+    assert.equal(bootstrapUrl.pathname, '/reauthorizations');
+    const rawBootstrap = bootstrapUrl.hash.slice('#gongxi-helper-launch='.length);
+    assert.match(rawBootstrap, /^[A-Za-z0-9_-]+$/);
+    const decodedBootstrap = JSON.parse(Buffer.from(rawBootstrap, 'base64url').toString('utf8'));
+    assert.deepEqual(decodedBootstrap, { bindingId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        runId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', sessionId: ID, target: 'https://www.microsoft.com/link' });
+    assert.equal(policy.bootstrapTarget({ sessionId: ID, verificationUri: 'https://evil.example/link' },
+        'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'), null);
     assert.equal(policy.workerRequiresPause({ ...control, handoffAt: 1000 }, {}, 22000), true);
     assert.equal(policy.workerRequiresPause({ ...control, handoffAt: 1000 }, { ...tab, heartbeat: 2000, paused: true }, 2000), true);
     assert.equal(policy.workerRequiresPause({ ...control, handoffAt: 1000, manual: true }, { ...tab, heartbeat: 2000, paused: true }, 2000), false);
+    const handedOff = { ...control, handoffAt: 1000 };
+    assert.equal(policy.workerConfirmedFreshLogin(handedOff,
+        { ...tab, heartbeat: 100, paused: false, freshLogin: true, freshLoginAt: 1500 }, 30000), true);
+    assert.equal(policy.workerConfirmedFreshLogin(handedOff,
+        { ...tab, heartbeat: 2000, paused: false, freshLogin: true, freshLoginAt: 500 }, 2000), false);
+    for (const freshLoginAt of [Number.NaN, Number.POSITIVE_INFINITY, 3000]) {
+        assert.equal(policy.workerConfirmedFreshLogin(handedOff,
+            { ...tab, heartbeat: 2000, paused: false, freshLogin: true, freshLoginAt }, 2000), false);
+    }
+    assert.equal(policy.workerConfirmedFreshLogin(handedOff,
+        { ...tab, bindingId: 'tampered', heartbeat: 2000, paused: false, freshLogin: true, freshLoginAt: 1500 }, 2000), false);
+    assert.equal(policy.workerRequiresPause(handedOff, { ...tab, heartbeat: Number.NaN }, 2000), true);
+    assert.equal(policy.workerRequiresPause(handedOff, { ...tab, heartbeat: 3000 }, 2000), true);
+    assert.equal(policy.workerConfirmedFreshLogin(handedOff,
+        { ...tab, heartbeat: 2000, paused: false, freshLogin: false, freshLoginAt: 1500 }, 2000), false);
+    const manualSuccess = { runId: 'r', sessionId: ID, bindingId: 'b', confirmedAt: 2500 };
+    assert.equal(policy.manualSuccessConfirmed({ ...handedOff, manualSuccess }, { sessionId: ID, status: 'SUCCEEDED' }, 3000), true);
+    assert.equal(policy.manualSuccessConfirmed({ ...handedOff, manualSuccess }, { sessionId: ID, status: 'PENDING' }, 3000), false);
+    assert.equal(policy.manualSuccessConfirmed({ ...handedOff, manualSuccess: { ...manualSuccess, confirmedAt: 500 } },
+        { sessionId: ID, status: 'SUCCEEDED' }, 3000), false);
     assert.doesNotMatch(source, /@grant\s+none|unsafeWindow|@require\s|postMessage\(/);
     assert.deepEqual([...source.matchAll(/@connect\s+([^\s]+)/g)].map((match) => match[1]), ['outlook.wujiaqiao.dpdns.org']);
+    assert.doesNotMatch(source, /GM_openInTab\(`https:\/\/microsoft\.com\/devicelogin/);
     assert.match(source, /cooldownUntil = Date\.now\(\) \+ 10000/);
     assert.match(source, /@sandbox\s+DOM/);
 });
