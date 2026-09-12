@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GongXi Mail 串行重新授权助手
 // @namespace    https://outlook.wujiaqiao.dpdns.org/
-// @version      1.0.2
+// @version      1.0.3
 // @description  仅为管理员当前设备授权会话填写登录信息；挑战、未知页面或身份不符时暂停。
 // @match        https://outlook.wujiaqiao.dpdns.org/*
 // @match        https://microsoft.com/devicelogin*
@@ -716,10 +716,16 @@
         const verificationEmailHeadings = allVisible('h1, h2, h3, h4, [role="heading"]')
             .filter((node) => /^(?:Verify your email|验证(?:你|您)的电子邮件)$/i.test(words(node)));
         const hardChallengeControl = !!one('#idTxtBx_SAOTCC_OTC, #iOttText, iframe[src*="captcha"], input[name="ProofConfirmation"]');
-        const hardChallengeText = /captcha|verify your identity|help us protect|unusual (?:activity|sign.in)|account (?:has been )?locked|security (?:code|info)|authenticator|approve (?:the |a )?(?:sign.in|request)|two.step|recover your account|验证码|验证你的身份|验证您的身份|保护你的帐户|保护您的帐户|帐户已锁定|账户已锁定|异常活动|安全代码|恢复帐户|恢复账户|人机验证|短信验证/i.test(text);
+        const blockingChallengeText = /captcha|verify your identity|help us protect|unusual (?:activity|sign.in)|account (?:has been )?locked|security (?:code|info)|authenticator|approve (?:the |a )?(?:sign.in|request)|two.step|recover your account|验证你的身份|验证您的身份|保护你的帐户|保护您的帐户|帐户已锁定|账户已锁定|异常活动|安全代码|恢复帐户|恢复账户|人机验证|短信验证/i.test(text);
         const oneTimeCodeChallenge = !isDevicePage && !!one('input[name="otc"][autocomplete="one-time-code"]');
+        // Ignore only the passive proof-choice label. Any other verification-code wording still
+        // means that a challenge is active or the layout is unknown and must pause.
+        const codeChallengeText = textLines(text).some((line) =>
+            !/^(?:发送验证码|send verification code)$/i.test(line) &&
+            /验证码|verification code/i.test(line));
         const passwordAlternative = !!passwordOption && proofChooser && verificationEmailHeadings.length === 1 &&
-            !hardChallengeControl && !hardChallengeText && !oneTimeCodeChallenge;
+            !hardChallengeControl && !blockingChallengeText && !codeChallengeText && !oneTimeCodeChallenge;
+        const hardChallengeText = blockingChallengeText || codeChallengeText;
         const hardChallenge = hardChallengeControl || hardChallengeText || oneTimeCodeChallenge ||
             proofChooser && !passwordAlternative;
         const challenge = proofChooser || hardChallenge;

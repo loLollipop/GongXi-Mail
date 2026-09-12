@@ -59,6 +59,7 @@ async function runMicrosoftScenario(options: {
     permissionContainerPresent?: boolean;
     permissionContainerText?: string;
     pageText?: string;
+    passwordOptionText?: string;
     hiddenClientIds?: readonly string[];
     hiddenScopes?: readonly string[];
     appNameTexts?: readonly string[];
@@ -109,7 +110,7 @@ async function runMicrosoftScenario(options: {
             options.view === 'email' ? 'Next' : 'Sign in';
     const submit = makeNode(submitText, 'idSIButton9');
     const picker = makeNode(options.pickerText ?? 'Use another account');
-    const passwordOption = makeNode('Use your password');
+    const passwordOption = makeNode(options.passwordOptionText ?? 'Use your password');
     const no = makeNode('No');
     const consentAccepts = Array.from({ length: options.consentAcceptCount ?? 1 }, () => makeNode('Accept', 'idSubmit_Consent'));
     const consentReject = makeNode('Reject', 'idBtn_Reject');
@@ -145,6 +146,7 @@ async function runMicrosoftScenario(options: {
     password.form = form;
     device.form = form;
     let clicks = 0;
+    let passwordOptionClicks = 0;
     let rejectClicks = 0;
     let clickReached: (() => void) | undefined;
     const reached = new Promise<void>((resolve) => { clickReached = resolve; });
@@ -198,6 +200,7 @@ async function runMicrosoftScenario(options: {
         getAttribute: (name: string) => name === 'href' ? options.entryHref ?? null : null,
         click: () => {
             clicks++;
+            passwordOptionClicks++;
             if (clicks >= (options.stopAfterClicks ?? Number.POSITIVE_INFINITY)) clickReached?.();
         },
     });
@@ -354,7 +357,7 @@ async function runMicrosoftScenario(options: {
     const execution = moduleValue.exports.microsoftMain();
     if (options.stopAfterClicks) await Promise.race([execution, reached]);
     else await execution;
-    return { requests, clicks, rejectClicks, submitEvents, inputValues: { device: device.value, email: email.value, password: password.value },
+    return { requests, clicks, passwordOptionClicks, rejectClicks, submitEvents, inputValues: { device: device.value, email: email.value, password: password.value },
         handoffEvents, tabState: durableTabState, values };
 }
 
@@ -1223,6 +1226,32 @@ void test('a passwordless-first verification page chooses the explicit password 
     assert.equal(result.clicks, 1);
 });
 
+void test('the Chinese verify-email proof chooser uses password instead of pausing on its send-code label', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.live.com/oauth20_remoteconnect.srf',
+        view: 'password-choice',
+        pageText: '验证你的电子邮件\n我们将向备用邮箱发送代码\n发送验证码\n已收到代码？\n使用密码',
+        headingTexts: ['验证你的电子邮件'],
+        passwordOptionText: '使用密码',
+        stopAfterClicks: 1,
+        tabTask: {
+            runId, sessionId: ID, bindingId, boundAt: now - 3000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), actions: { device: true, email: true },
+            ...submittedLogin(runId, bindingId, now),
+        },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 1);
+    assert.equal(result.passwordOptionClicks, 1);
+});
+
 for (const challenge of ['Recover your account', 'captcha', 'Authenticator'] as const) {
     void test(`a ${challenge} challenge pauses even when a password option is present`, async () => {
         const now = Date.now();
@@ -1232,7 +1261,6 @@ for (const challenge of ['Recover your account', 'captcha', 'Authenticator'] as 
             url: 'https://login.live.com/oauth20_remoteconnect.srf',
             view: 'password-choice',
             pageText: challenge,
-            headingTexts: [challenge],
             tabTask: {
                 runId, sessionId: ID, bindingId, boundAt: now - 3000, expiresAt: now + 60000,
                 capability: 'c'.repeat(43), actions: { device: true, email: true },
@@ -1245,6 +1273,58 @@ for (const challenge of ['Recover your account', 'captcha', 'Authenticator'] as 
         });
         assert.deepEqual(result.requests, ['current']);
         assert.equal(result.clicks, 0);
+    });
+}
+
+void test('an active verification-code prompt pauses even if the verify-email heading and password option remain', async () => {
+    const now = Date.now();
+    const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const result = await runMicrosoftScenario({
+        url: 'https://login.live.com/oauth20_remoteconnect.srf',
+        view: 'password-choice',
+        pageText: '验证你的电子邮件\n请输入验证码\n使用密码',
+        headingTexts: ['验证你的电子邮件'],
+        passwordOptionText: '使用密码',
+        tabTask: {
+            runId, sessionId: ID, bindingId, boundAt: now - 3000, expiresAt: now + 60000,
+            capability: 'c'.repeat(43), actions: { device: true, email: true },
+            ...submittedLogin(runId, bindingId, now),
+        },
+        values: {
+            'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+            'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+        },
+    });
+    assert.deepEqual(result.requests, ['current']);
+    assert.equal(result.clicks, 0);
+    assert.equal(result.passwordOptionClicks, 0);
+});
+
+for (const [label, clicks] of [['Send verification code', 1], ['Send a verification code', 0]] as const) {
+    void test(`the English proof-choice label ${JSON.stringify(label)} produces ${clicks} password clicks`, async () => {
+        const now = Date.now();
+        const runId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        const bindingId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+        const result = await runMicrosoftScenario({
+            url: 'https://login.live.com/oauth20_remoteconnect.srf',
+            view: 'password-choice',
+            pageText: `Verify your email\n${label}\nUse your password`,
+            headingTexts: ['Verify your email'],
+            ...(clicks ? { stopAfterClicks: 1 } : {}),
+            tabTask: {
+                runId, sessionId: ID, bindingId, boundAt: now - 3000, expiresAt: now + 60000,
+                capability: 'c'.repeat(43), actions: { device: true, email: true },
+                ...submittedLogin(runId, bindingId, now),
+            },
+            values: {
+                'gongxi-helper-control-v1': { state: 'running', runId, sessionId: ID, bindingId, heartbeat: now, manual: false },
+                'gongxi-helper-heartbeat-v1': { runId, heartbeat: now },
+            },
+        });
+        assert.deepEqual(result.requests, ['current']);
+        assert.equal(result.clicks, clicks);
+        assert.equal(result.passwordOptionClicks, clicks);
     });
 }
 
