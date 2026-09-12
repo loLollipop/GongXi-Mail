@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { reauthorizationService } from './reauthorization.service.js';
 import { AppError } from '../../plugins/error.js';
+import { helperService } from '../reauthorization-helper/helper.service.js';
 
 const sessionParams = z.object({ id: z.string().uuid() });
 
@@ -22,6 +23,12 @@ const reauthorizationRoutes: FastifyPluginAsync = async (fastify) => {
     fastify.post('/start', async (request) => {
         const { emailId } = z.object({ emailId: z.number().int().positive() }).strict().parse(request.body);
         return { success: true, data: await reauthorizationService.start(emailId, request.user!.id) };
+    });
+    fastify.post('/:id/helper-ticket', async (request) => {
+        z.object({}).strict().parse(request.body);
+        return { success: true, data: await helperService.issue(sessionParams.parse(request.params).id,
+            request.user!.id, request.headers['user-agent'] ?? '',
+            (event) => request.log.info(event, '授权助手凭据审计')) };
     });
     fastify.get('/:id', async (request) => ({ success: true,
         data: await reauthorizationService.get(sessionParams.parse(request.params).id) }));

@@ -76,7 +76,7 @@ void test('identity check fails closed and scopes use one Graph resource', () =>
 
 void test('public DTO explicitly excludes device codes, claims, client IDs and token versions', () => {
     const value = publicSession(fixture());
-    for (const key of ['deviceCode', 'device_code', 'access_token', 'refresh_token', 'clientId', 'tokenVersion', 'pollClaim']) assert.equal(key in value, false, key);
+    for (const key of ['deviceCode', 'device_code', 'access_token', 'refresh_token', 'password', 'clientId', 'tokenVersion', 'pollClaim']) assert.equal(key in value, false, key);
     assert.doesNotMatch(JSON.stringify(value), /secret-device-code/);
 });
 
@@ -164,6 +164,7 @@ void test('candidates only include reauthorization errors and expose recoverable
     assert.equal(result[0].unsupportedReason, null);
     assert.equal(result[1].supported, false);
     assert.match(result[1].unsupportedReason ?? '', /仅 IMAP/);
+    assert.equal(result.some((candidate) => 'password' in candidate || !!candidate.activeSession && 'password' in candidate.activeSession), false);
     assert.doesNotMatch(JSON.stringify(result), /secret/);
 });
 
@@ -221,7 +222,7 @@ for (const scenario of ['success', 'mismatch', 'missing_token', 'missing_scope',
     });
 }
 
-void test('all five endpoints require JWT then SUPER_ADMIN; validation runs after authentication', async (t) => {
+void test('all six endpoints require JWT then SUPER_ADMIN; validation runs after authentication', async (t) => {
     const app = Fastify();
     app.decorate('authenticateJwt', async (request) => {
         if (request.headers.authorization !== 'Bearer valid') throw new AppError('UNAUTHORIZED', 'Authentication required', 401);
