@@ -86,6 +86,37 @@ function isTerminalFallbackError(error: unknown): boolean {
     );
 }
 
+interface ImapCapabilityReader {
+    serverSupports(capability: string): boolean;
+}
+
+export function applyXoauth2LoginCompatibility(
+    imap: ImapCapabilityReader,
+    xoauth2: string | undefined
+): void {
+    if (!xoauth2) return;
+
+    const serverSupports = imap.serverSupports.bind(imap);
+    imap.serverSupports = (capability: string): boolean => {
+        if (capability === 'LOGINDISABLED' && serverSupports('AUTH=XOAUTH2')) {
+            return false;
+        }
+        return serverSupports(capability);
+    };
+}
+
+export function normalizeImapConnectionError(error: Error): Error {
+    const source = (error as Error & { source?: unknown }).source;
+    if (source === 'authentication') {
+        return new AppError(
+            'IMAP_AUTHENTICATION_FAILED',
+            'IMAP authentication failed. Reauthorize the email account and confirm IMAP access is enabled.',
+            409
+        );
+    }
+    return error;
+}
+
 export const mailService = {
     /**
      * 解析凭证
@@ -388,11 +419,9 @@ export const mailService = {
                 host: 'outlook.office365.com',
                 port: 993,
                 tls: true,
-                tlsOptions: {
-                    rejectUnauthorized: false,
-                },
             };
             const imap = new Imap(imapConfig);
+            applyXoauth2LoginCompatibility(imap, imapConfig.xoauth2);
 
             const emailList: EmailMessage[] = [];
             let messageCount = 0;
@@ -470,8 +499,13 @@ export const mailService = {
             });
 
             imap.once('error', (err: Error) => {
-                logger.error({ err }, 'IMAP connection error');
-                reject(err);
+                const normalizedError = normalizeImapConnectionError(err);
+                if (normalizedError instanceof AppError) {
+                    logger.warn({ email, source: 'authentication' }, 'IMAP authentication failed');
+                } else {
+                    logger.error({ err }, 'IMAP connection error');
+                }
+                reject(normalizedError);
             });
 
             imap.once('end', () => {
