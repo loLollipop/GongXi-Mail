@@ -6,9 +6,132 @@ process.env.DATABASE_URL = 'postgresql://test:test@127.0.0.1:1/test';
 process.env.ENCRYPTION_KEY = '01234567890123456789012345678901';
 process.env.JWT_SECRET = 'test-jwt-secret-for-email-status-0000';
 
-const { statusUpdateDecision, updateEmailStatusWithDb } = await import('./email.service.js');
+const { decrypt } = await import('../../lib/crypto.js');
+const { importEmailAccountsWithDb, statusUpdateDecision, updateEmailStatusWithDb } = await import('./email.service.js');
 
 type EmailStatusDb = Pick<Prisma.TransactionClient, 'emailAccount'>;
+type EmailImportDb = Pick<Prisma.TransactionClient, 'emailAccount' | 'emailGroup'>;
+
+void test('email import parses CRLF and four-column rows and uses upsert payloads', async () => {
+    const upserts: Prisma.EmailAccountUpsertArgs[] = [];
+    let groupLookups = 0;
+    const db = {
+        emailGroup: {
+            findUnique: async () => {
+                groupLookups += 1;
+                return { id: 7 };
+            },
+        },
+        emailAccount: {
+            upsert: async (input: Prisma.EmailAccountUpsertArgs) => {
+                upserts.push(input);
+                return {};
+            },
+        },
+    } as unknown as EmailImportDb;
+
+    const result = await importEmailAccountsWithDb(db, {
+        content: 'one@example.com---- secret ----client-1----refresh-1\r\n\r\nbroken\r\ntwo@example.com----client-2----refresh-2\r\nsix@example.com----client-6----uuid----info----refresh-6',
+        separator: '----',
+        groupId: 7,
+    });
+
+    assert.equal(groupLookups, 1);
+    assert.deepEqual({ success: result.success, failed: result.failed }, { success: 3, failed: 1 });
+    assert.match(result.errors[0] || '', /^Line 3: Invalid format$/);
+    assert.equal(upserts.length, 3);
+
+    const first = upserts[0];
+    assert.deepEqual(first.where, { email: 'one@example.com' });
+    assert.equal(first.update.clientId, 'client-1');
+    assert.deepEqual(first.update.tokenVersion, { increment: 1 });
+    assert.equal(first.update.status, 'ACTIVE');
+    assert.equal(first.update.errorMessage, null);
+    assert.equal(first.update.groupId, 7);
+    assert.equal(decrypt(first.update.refreshToken as string), 'refresh-1');
+    assert.equal(decrypt(first.update.password as string), ' secret ');
+    assert.equal(first.create.groupId, 7);
+    assert.equal(decrypt(first.create.refreshToken), 'refresh-1');
+    assert.equal(decrypt(first.create.password as string), ' secret ');
+    assert.ok(first.update.tokenRefreshedAt instanceof Date);
+    assert.equal(Object.hasOwn(first.create, 'tokenRefreshedAt'), false);
+
+    const second = upserts[1];
+    assert.equal(Object.hasOwn(second.update, 'password'), false);
+    assert.equal(Object.hasOwn(second.create, 'password'), false);
+
+    const third = upserts[2];
+    assert.equal(third.update.clientId, 'client-6');
+    assert.equal(decrypt(third.update.refreshToken as string), 'refresh-6');
+});
+
+void test('email import leaves optional password and group unchanged when omitted', async () => {
+    let upsert: Prisma.EmailAccountUpsertArgs | undefined;
+    const db = {
+        emailGroup: { findUnique: async () => null },
+        emailAccount: {
+            upsert: async (input: Prisma.EmailAccountUpsertArgs) => {
+                upsert = input;
+                return {};
+            },
+        },
+    } as unknown as EmailImportDb;
+
+    const result = await importEmailAccountsWithDb(db, {
+        content: 'three@example.com----client-3----refresh-3',
+        separator: '----',
+    });
+
+    assert.deepEqual(result, { success: 1, failed: 0, errors: [] });
+    assert.ok(upsert);
+    assert.equal(Object.hasOwn(upsert.update, 'password'), false);
+    assert.equal(Object.hasOwn(upsert.update, 'groupId'), false);
+    assert.equal(Object.hasOwn(upsert.create, 'password'), false);
+    assert.equal(Object.hasOwn(upsert.create, 'groupId'), false);
+});
+
+void test('email import errors never echo credentials when the separator is wrong', async () => {
+    const db = {
+        emailGroup: { findUnique: async () => null },
+        emailAccount: { upsert: async () => ({}) },
+    } as unknown as EmailImportDb;
+    const password = 'do-not-return-this-password';
+    const refreshToken = 'do-not-return-this-refresh-token';
+
+    const result = await importEmailAccountsWithDb(db, {
+        content: `four@example.com----${password}----client-4----${refreshToken}`,
+        separator: '|',
+    });
+
+    assert.deepEqual({ success: result.success, failed: result.failed }, { success: 0, failed: 1 });
+    assert.match(result.errors[0] || '', /^Line 1: Invalid format$/);
+    assert.equal(result.errors.join('\n').includes(password), false);
+    assert.equal(result.errors.join('\n').includes(refreshToken), false);
+});
+
+void test('email import sanitizes database errors before returning them', async () => {
+    const secret = 'database-error-must-not-return-this-token';
+    const db = {
+        emailGroup: { findUnique: async () => null },
+        emailAccount: {
+            upsert: async () => {
+                throw new Error(`database rejected ${secret}`);
+            },
+        },
+    } as unknown as EmailImportDb;
+
+    const result = await importEmailAccountsWithDb(db, {
+        content: 'five@example.com----client-5----refresh-5',
+        separator: '----',
+    });
+
+    assert.deepEqual(result, {
+        success: 0,
+        failed: 1,
+        errors: ['Line 1: Unable to save email account'],
+    });
+    assert.equal(result.errors.join('\n').includes(secret), false);
+});
 
 void test('status updates preserve an existing reauthorization marker', () => {
     const current = { status: 'ERROR' as const, errorMessage: 'invalid_grant: AADSTS65001: REAUTHORIZATION_REQUIRED' };

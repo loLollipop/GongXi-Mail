@@ -41,6 +41,7 @@ import dayjs from 'dayjs';
 const { Title, Text } = Typography;
 const { TextArea } = Input;
 const { Dragger } = Upload;
+const IMPORT_BATCH_SIZE = 100;
 const MAIL_FETCH_STRATEGY_OPTIONS = [
     { value: 'GRAPH_FIRST', label: 'Graph 优先（失败回退 IMAP）' },
     { value: 'IMAP_FIRST', label: 'IMAP 优先（失败回退 Graph）' },
@@ -98,6 +99,13 @@ interface EmailDetailsResult extends EmailAccount {
     refreshToken?: string;
 }
 
+interface ImportSummary {
+    success: number;
+    failed: number;
+    unconfirmed: number;
+    errors: string[];
+}
+
 const EmailsPage: React.FC = () => {
     const admin = useAuthStore((state) => state.admin);
     const hasSuperAdminPermission = isSuperAdmin(admin?.role);
@@ -117,6 +125,9 @@ const EmailsPage: React.FC = () => {
     const [importContent, setImportContent] = useState('');
     const [separator, setSeparator] = useState('----');
     const [importGroupId, setImportGroupId] = useState<number | undefined>(undefined);
+    const [importing, setImporting] = useState(false);
+    const [importProgress, setImportProgress] = useState<{ current: number; total: number } | null>(null);
+    const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
     const [mailList, setMailList] = useState<MailItem[]>([]);
     const [mailLoading, setMailLoading] = useState(false);
     const [currentEmail, setCurrentEmail] = useState<string>('');
@@ -143,6 +154,7 @@ const EmailsPage: React.FC = () => {
     const [batchRefreshing, setBatchRefreshing] = useState(false);
     const latestListRequestIdRef = useRef(0);
     const passwordRequestIdRef = useRef(0);
+    const importingRef = useRef(false);
 
     useEffect(() => () => {
         passwordRequestIdRef.current += 1;
@@ -368,29 +380,91 @@ const EmailsPage: React.FC = () => {
     };
 
     const handleImport = async () => {
-        if (!importContent.trim()) {
+        if (importingRef.current) return;
+
+        const lines = importContent
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean);
+        if (lines.length === 0) {
             message.warning('请输入或粘贴邮箱数据');
             return;
         }
+        if (!separator) {
+            message.warning('请输入分隔符');
+            return;
+        }
 
+        importingRef.current = true;
+        setImporting(true);
+        setImportSummary(null);
+        const totalBatches = Math.ceil(lines.length / IMPORT_BATCH_SIZE);
+        const summary: ImportSummary = { success: 0, failed: 0, unconfirmed: 0, errors: [] };
         try {
-            const res = await emailApi.import(
-                importContent,
-                separator,
-                toOptionalNumber(importGroupId)
-            );
-            if (res.code === 200) {
-                message.success(res.message);
+            for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
+                const start = batchIndex * IMPORT_BATCH_SIZE;
+                const batchLines = lines.slice(start, start + IMPORT_BATCH_SIZE);
+                setImportProgress({ current: batchIndex + 1, total: totalBatches });
+
+                try {
+                    const res = await emailApi.import(
+                        batchLines.join('\n'),
+                        separator,
+                        toOptionalNumber(importGroupId)
+                    );
+                    if (res.code !== 200) {
+                        throw new Error(res.message || '请求失败');
+                    }
+                    const result = res.data;
+                    const hasValidCounts = Number.isSafeInteger(result?.success)
+                        && result.success >= 0
+                        && Number.isSafeInteger(result.failed)
+                        && result.failed >= 0
+                        && result.success + result.failed === batchLines.length;
+                    const hasValidErrors = Array.isArray(result?.errors)
+                        && result.errors.every((error) => typeof error === 'string');
+                    if (!hasValidCounts || !hasValidErrors) {
+                        throw new Error('服务器返回的导入结果无效');
+                    }
+
+                    summary.success += result.success;
+                    summary.failed += result.failed;
+                    summary.errors.push(...result.errors.map((error) => {
+                        const lineError = /^Line (\d+):(.*)$/.exec(error);
+                        const detail = lineError
+                            ? `导入第 ${start + Number(lineError[1])} 行：${lineError[2].trim()}`
+                            : error;
+                        return `第 ${batchIndex + 1}/${totalBatches} 批：${detail}`;
+                    }));
+                } catch (err: unknown) {
+                    const errorMessage = getErrorMessage(err, '请求失败');
+                    summary.unconfirmed += batchLines.length;
+                    summary.errors.push(
+                        `第 ${batchIndex + 1}/${totalBatches} 批（导入行 ${start + 1}-${start + batchLines.length}）结果未确认：${errorMessage}`
+                    );
+                }
+            }
+
+            setImportSummary({ ...summary });
+            if (summary.success > 0) {
+                await Promise.all([fetchData(), fetchGroups()]);
+            }
+
+            if (summary.failed === 0 && summary.unconfirmed === 0 && summary.success === lines.length) {
+                message.success(`导入完成：成功 ${summary.success} 条，共 ${totalBatches} 批`);
                 setImportModalVisible(false);
                 setImportContent('');
                 setImportGroupId(undefined);
-                fetchData();
-                fetchGroups();
+                setImportSummary(null);
             } else {
-                message.error(res.message);
+                message.warning(
+                    `导入完成：成功 ${summary.success} 条，失败 ${summary.failed} 条，结果未确认 ${summary.unconfirmed} 条；输入内容已保留`
+                );
             }
-        } catch (err: unknown) {
-            message.error(getErrorMessage(err, '导入失败'));
+        } finally {
+            importingRef.current = false;
+            setImporting(false);
+            setImportProgress(null);
         }
     };
 
@@ -901,7 +975,11 @@ const EmailsPage: React.FC = () => {
                                         >
                                             刷新全部 Token
                                         </Button>
-                                        <Button icon={<UploadOutlined />} onClick={() => setImportModalVisible(true)}>
+                                        <Button icon={<UploadOutlined />} onClick={() => {
+                                            setImportSummary(null);
+                                            setImportProgress(null);
+                                            setImportModalVisible(true);
+                                        }}>
                                             导入
                                         </Button>
                                         <Button icon={<DownloadOutlined />} onClick={handleExport}>
@@ -1047,11 +1125,40 @@ const EmailsPage: React.FC = () => {
                 title="批量导入邮箱"
                 open={importModalVisible}
                 onOk={handleImport}
-                onCancel={() => setImportModalVisible(false)}
+                onCancel={() => {
+                    if (!importingRef.current) setImportModalVisible(false);
+                }}
+                confirmLoading={importing}
+                closable={!importing}
+                maskClosable={!importing}
+                keyboard={!importing}
+                okButtonProps={{ disabled: importing }}
+                cancelButtonProps={{ disabled: importing }}
                 destroyOnClose
                 width={700}
             >
                 <Space direction="vertical" style={{ width: '100%' }} size="middle">
+                    {importProgress && (
+                        <Text strong>正在导入第 {importProgress.current}/{importProgress.total} 批，请勿关闭窗口</Text>
+                    )}
+                    {importSummary && (
+                        <div>
+                            <Text strong type={importSummary.failed > 0 || importSummary.unconfirmed > 0 ? 'warning' : 'success'}>
+                                导入汇总：成功 {importSummary.success} 条，失败 {importSummary.failed} 条，
+                                结果未确认 {importSummary.unconfirmed} 条
+                            </Text>
+                            {importSummary.errors.length > 0 && (
+                                <div style={{ maxHeight: 160, overflow: 'auto', marginTop: 8 }}>
+                                    {importSummary.errors.slice(0, 100).map((error, index) => (
+                                        <div key={`${index}-${error}`}><Text type="danger">{error}</Text></div>
+                                    ))}
+                                    {importSummary.errors.length > 100 && (
+                                        <Text type="secondary">另有 {importSummary.errors.length - 100} 条错误未展开</Text>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    )}
                     <div>
                         <Text type="secondary">
                             上传文件或粘贴内容。支持多种格式，将尝试自动解析。
@@ -1063,6 +1170,7 @@ const EmailsPage: React.FC = () => {
                         addonBefore="分隔符"
                         value={separator}
                         onChange={(e) => setSeparator(e.target.value)}
+                        disabled={importing}
                         style={{ width: 200 }}
                     />
                     <Select
@@ -1071,6 +1179,7 @@ const EmailsPage: React.FC = () => {
                         value={importGroupId}
                         options={groupOptions}
                         onChange={(value: number | string | undefined) => setImportGroupId(toOptionalNumber(value))}
+                        disabled={importing}
                         style={{ width: 260 }}
                     />
                     <Dragger
@@ -1098,6 +1207,7 @@ const EmailsPage: React.FC = () => {
                         showUploadList={false}
                         maxCount={1}
                         accept=".txt,.csv"
+                        disabled={importing}
                     >
                         <p className="ant-upload-drag-icon">
                             <InboxOutlined />
@@ -1109,6 +1219,7 @@ const EmailsPage: React.FC = () => {
                         rows={12}
                         value={importContent}
                         onChange={(e) => setImportContent(e.target.value)}
+                        disabled={importing}
                         placeholder={`example@outlook.com${separator}client_id${separator}refresh_token`}
                     />
                 </Space>

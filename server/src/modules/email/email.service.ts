@@ -20,6 +20,104 @@ export function statusUpdateDecision(
 
 type EmailStatusDb = Pick<Prisma.TransactionClient, 'emailAccount'>;
 type EmailPasswordDb = Pick<Prisma.TransactionClient, 'emailAccount'>;
+export type EmailImportDb = Pick<Prisma.TransactionClient, 'emailAccount' | 'emailGroup'>;
+
+export async function importEmailAccountsWithDb(
+    db: EmailImportDb,
+    input: ImportEmailInput,
+): Promise<{ success: number; failed: number; errors: string[] }> {
+    const { content, separator, groupId } = input;
+    if (!separator) {
+        throw new AppError('INVALID_SEPARATOR', 'Import separator cannot be empty', 400);
+    }
+
+    const lines = content
+        .split(/\r?\n/)
+        .map((line, index) => ({ value: line.trim(), lineNumber: index + 1 }))
+        .filter(({ value }) => Boolean(value));
+
+    if (groupId !== undefined) {
+        const group = await db.emailGroup.findUnique({ where: { id: groupId } });
+        if (!group) {
+            throw new AppError('GROUP_NOT_FOUND', 'Email group not found', 404);
+        }
+    }
+
+    let success = 0;
+    let failed = 0;
+    const errors: string[] = [];
+
+    for (const { value: line, lineNumber } of lines) {
+        try {
+            const parts = line.split(separator);
+            if (parts.length < 3) {
+                throw new Error('Invalid format');
+            }
+
+            let email: string;
+            let clientId: string;
+            let refreshToken: string;
+            let password: string | undefined;
+
+            if (parts.length >= 5) {
+                [email, clientId] = parts;
+                refreshToken = parts[4];
+            } else if (parts.length === 4) {
+                email = parts[0];
+                password = parts[1] || undefined;
+                clientId = parts[2];
+                refreshToken = parts[3];
+            } else {
+                [email, clientId, refreshToken] = parts;
+            }
+            if (!email || !clientId || !refreshToken) {
+                throw new Error('Missing required fields');
+            }
+
+            const now = new Date();
+            const encryptedToken = encrypt(refreshToken);
+            const updateData: Prisma.EmailAccountUncheckedUpdateInput = {
+                clientId,
+                refreshToken: encryptedToken,
+                tokenVersion: { increment: 1 },
+                tokenRefreshedAt: now,
+                errorMessage: null,
+                status: 'ACTIVE',
+            };
+            const createData: Prisma.EmailAccountUncheckedCreateInput = {
+                email,
+                clientId,
+                refreshToken: encryptedToken,
+                status: 'ACTIVE',
+            };
+
+            if (password) {
+                const encryptedPassword = encrypt(password);
+                updateData.password = encryptedPassword;
+                createData.password = encryptedPassword;
+            }
+            if (groupId !== undefined) {
+                updateData.groupId = groupId;
+                createData.groupId = groupId;
+            }
+
+            await db.emailAccount.upsert({
+                where: { email },
+                update: updateData,
+                create: createData,
+            });
+            success += 1;
+        } catch (err) {
+            failed += 1;
+            const message = err instanceof Error && ['Invalid format', 'Missing required fields'].includes(err.message)
+                ? err.message
+                : 'Unable to save email account';
+            errors.push(`Line ${lineNumber}: ${message}`);
+        }
+    }
+
+    return { success, failed, errors };
+}
 
 export async function getEmailPasswordWithDb(
     db: EmailPasswordDb,
@@ -343,102 +441,7 @@ export const emailService = {
      * 批量导入
      */
     async import(input: ImportEmailInput) {
-        const { content, separator, groupId } = input;
-        const lines = content.split('\n').filter((line: string) => line.trim());
-
-        if (groupId !== undefined) {
-            const group = await prisma.emailGroup.findUnique({ where: { id: groupId } });
-            if (!group) {
-                throw new AppError('GROUP_NOT_FOUND', 'Email group not found', 404);
-            }
-        }
-
-        let success = 0;
-        let failed = 0;
-        const errors: string[] = [];
-
-        for (const line of lines) {
-            try {
-                const parts = line.trim().split(separator);
-                if (parts.length < 3) {
-                    throw new Error('Invalid format');
-                }
-
-                let email, clientId, refreshToken, password;
-
-                // 尝试猜测格式
-                // 1. email----password----clientId----refreshToken (4列)
-                // 2. email----clientId----refreshToken (3列)
-                // 3. email----clientId----uuid----info----refreshToken (5列)
-
-                if (parts.length >= 5) {
-                    // email----clientId----uuid----info----refreshToken
-                    email = parts[0];
-                    clientId = parts[1];
-                    refreshToken = parts[4];
-                    // 这种格式通常没有密码，或者密码隐藏在 info 里？暂且不处理密码
-                } else if (parts.length === 4) {
-                    // email----password----clientId----refreshToken
-                    email = parts[0];
-                    password = parts[1];
-                    clientId = parts[2];
-                    refreshToken = parts[3];
-                } else {
-                    // email----clientId----refreshToken
-                    email = parts[0];
-                    clientId = parts[1];
-                    refreshToken = parts[2];
-                }
-
-                if (!email || !clientId || !refreshToken) {
-                    throw new Error('Missing required fields');
-                }
-
-                const data: Prisma.EmailAccountUncheckedUpdateInput = {
-                    clientId,
-                    refreshToken: encrypt(refreshToken),
-                    tokenVersion: { increment: 1 },
-                    tokenRefreshedAt: new Date(),
-                    errorMessage: null,
-                    status: 'ACTIVE',
-                };
-                if (password) data.password = encrypt(password);
-                if (groupId !== undefined) data.groupId = groupId;
-
-                // 检查是否存在
-                const exists = await prisma.emailAccount.findUnique({ where: { email } });
-                if (exists) {
-                    // 更新
-                    await prisma.emailAccount.update({
-                        where: { email },
-                        data,
-                    });
-                } else {
-                    // 创建
-                    const createData: Prisma.EmailAccountUncheckedCreateInput = {
-                        email,
-                        clientId,
-                        refreshToken: encrypt(refreshToken),
-                        status: 'ACTIVE',
-                    };
-                    if (password) {
-                        createData.password = encrypt(password);
-                    }
-                    if (groupId !== undefined) {
-                        createData.groupId = groupId;
-                    }
-                    await prisma.emailAccount.create({
-                        data: createData,
-                    });
-                }
-                success++;
-            } catch (err) {
-                failed++;
-                errors.push(`Line "${line.substring(0, 30)}...": ${(err as Error).message}`);
-            }
-        }
-
-        return { success, failed, errors };
+        return importEmailAccountsWithDb(prisma, input);
     },
 
     /**

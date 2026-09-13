@@ -39,6 +39,12 @@ interface ApiPagedList<T> {
     total: number;
 }
 
+export interface EmailImportResult {
+    success: number;
+    failed: number;
+    errors: string[];
+}
+
 interface RequestGetConfig extends AxiosRequestConfig {
     dedupe?: boolean;
     cacheMs?: number;
@@ -529,10 +535,11 @@ export const emailApi = {
         ),
 
     import: (content: string, separator?: string, groupId?: number) =>
-        requestPost<Record<string, unknown>, { content: string; separator?: string; groupId?: number }>(
+        requestPost<EmailImportResult, { content: string; separator?: string; groupId?: number }>(
             '/admin/emails/import',
             { content, separator, groupId },
             {
+                timeout: 60000,
                 invalidatePrefixes: ['/admin/emails', '/admin/email-groups', '/admin/api-keys', '/admin/dashboard/stats'],
             }
         ),
